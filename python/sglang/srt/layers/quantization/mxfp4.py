@@ -253,6 +253,10 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
         opt_flags.update_opt_flags_constraints(constraints)
         k_size = quant_tensor.shape[-1] * 2  # packed e2m1: 2 fp4 values per byte
         scale = _pad_hopper_mxfp4_scale(scale=scale, k_size=k_size)
+    elif get_platform().is_cuda and get_platform().device_capability < (9, 0):
+        # No scale layout carries the warp count below Hopper, and the tile
+        # formula gives the batch-1 decode tile a single warp.
+        opt_flags.update_opt_flags_constraints({"num_warps": num_warps})
     # transpose the tensor so that the quantization axis is on dim1
     quant_tensor = quant_tensor.transpose(-2, -1)
     scale = scale.transpose(-2, -1)
@@ -1478,10 +1482,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             swiglu_alpha=layer.swiglu_alpha,
             swiglu_beta=layer.swiglu_beta,
             swiglu_limit=layer.swiglu_limit,
-            moe_tp_size=layer.moe_tp_size,
-            moe_tp_rank=layer.moe_tp_rank,
-            moe_ep_size=layer.moe_ep_size,
-            moe_ep_rank=layer.moe_ep_rank,
             padded_hidden=self._padded_hidden,
         )
         return self.runner.run(dispatch_output, quant_info)
@@ -1525,10 +1525,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             swiglu_alpha=layer.swiglu_alpha,
             swiglu_beta=layer.swiglu_beta,
             swiglu_limit=layer.swiglu_limit,
-            moe_tp_size=layer.moe_tp_size,
-            moe_tp_rank=layer.moe_tp_rank,
-            moe_ep_size=layer.moe_ep_size,
-            moe_ep_rank=layer.moe_ep_rank,
             padded_hidden=self._padded_hidden,
         )
         return self.runner.run(dispatch_output, quant_info)

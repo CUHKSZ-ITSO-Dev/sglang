@@ -34,6 +34,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
     from sglang.srt.mem_cache.pool_host import HostKVCache
 
 from sglang.srt.layers.dp_attention import (
@@ -48,6 +49,17 @@ from sglang.srt.utils import get_device_module
 logger = logging.getLogger(__name__)
 
 device_module = get_device_module()
+
+
+def storage_model_name(
+    model_name: Optional[str], host_pool: HostKVCache | LogicalHostPool
+) -> Optional[str]:
+    """The model name storage backends key pages on, tagged with the host
+    pool's page format when it has one of its own."""
+    tag = host_pool.storage_format_tag
+    if tag is None:
+        return model_name
+    return f"{model_name}-{tag}" if model_name else tag
 
 
 class LayerLoadingEvent:
@@ -693,17 +705,15 @@ class HiCacheController:
         if storage_backend_extra_config is None:
             storage_backend_extra_config = {}
 
+        parallel = get_parallel()
         if is_dp_attention_enabled():
-            self.tp_rank = get_parallel().attn_tp_rank
-            self.tp_size = get_parallel().attn_tp_size
-            self.dp_rank = get_parallel().attn_dp_rank
+            tp_rank = parallel.attn_tp_rank
+            tp_size = parallel.attn_tp_size
+            dp_rank = parallel.attn_dp_rank
         else:
-            self.tp_rank = get_parallel().tp_rank
-            self.tp_size = get_parallel().tp_size
-            self.dp_rank = 0
-
-        self.pp_rank = get_parallel().pp_rank
-        self.pp_size = get_parallel().pp_size
+            tp_rank = parallel.tp_rank
+            tp_size = parallel.tp_size
+            dp_rank = 0
 
         # Currently, NPUMLATokenToKVPool is the subclass of MLATokenToKVPool.
         # DeepSeekV4TokenToKVPool has compressed MLA-style rank-replicated cache
@@ -720,22 +730,23 @@ class HiCacheController:
         should_split_heads = False
 
         if tp_lcm_size:
-            assert tp_lcm_size % self.tp_size == 0, (
+            assert tp_lcm_size % tp_size == 0, (
                 "tp_lcm_size must be divisible by tp_size."
             )
             should_split_heads = (
                 not is_rank_replicated
                 and self.mem_pool_host.layout == "page_head"
-                and tp_lcm_size > self.tp_size
+                and tp_lcm_size > tp_size
             )
 
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
+        model_name = storage_model_name(model_name, self.storage_host_pool)
 
         return HiCacheStorageConfig(
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
-            pp_rank=self.pp_rank,
-            pp_size=self.pp_size,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            pp_rank=parallel.pp_rank,
+            pp_size=parallel.pp_size,
             attn_cp_rank=attn_cp_rank,
             attn_cp_size=attn_cp_size,
             # TODO(hzh): Rename is_mla_model to is_rank_replicated.
@@ -745,22 +756,20 @@ class HiCacheController:
             model_name=model_name,
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
-            dp_rank=self.dp_rank,
+            dp_rank=dp_rank,
             extra_config=storage_backend_extra_config,
         )
 
     def reset(self):
-        self.storage_stop_event.set()
+        # Reuse detach's queue wakeups and bounded joins, and fail if any
+        # storage thread remains alive before clearing shared state.
+        self._stop_storage_threads()
 
         self.write_queue.clear()
         self.load_queue.clear()
         self.ack_write_queue.clear()
         self.ack_load_queue.clear()
         if self.enable_storage:
-            self.prefetch_thread.join()
-            self.prefetch_io_aux_thread.join()
-            self.prefetch_sync_thread.join()
-            self.backup_thread.join()
             self.prefetch_queue.queue.clear()
             self.backup_queue.queue.clear()
             self.prefetch_buffer.queue.clear()
@@ -805,10 +814,13 @@ class HiCacheController:
         device_indices: torch.Tensor,
         priority: Optional[int] = None,
         node_id: int = -1,
+        extra_pools: Optional[List[PoolTransfer]] = None,
     ) -> Optional[torch.Tensor]:
         """
         Back up KV caches from device memory to host memory.
         """
+        if extra_pools:
+            raise ValueError("Side-pool transfers require HybridCacheController.")
         host_indices = self.mem_pool_host.alloc(len(device_indices))
         if host_indices is None:
             return None
@@ -986,10 +998,6 @@ class HiCacheController:
             )
         )
         return producer_id
-
-    def evict_device(self, device_indices: torch.Tensor) -> int:
-        self.mem_pool_device_allocator.free(device_indices)
-        return len(device_indices)
 
     def evict_host(self, host_indices: torch.Tensor, backup_only: bool = True) -> int:
         if not backup_only:
