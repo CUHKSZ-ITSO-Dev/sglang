@@ -9,6 +9,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
+    PrefillLookahead,
     SchedulePolicy,
     estimate_prefill_extend_tile_metrics,
 )
@@ -1398,6 +1399,72 @@ class TestPrefillAdder(CustomTestCase):
                     label, priority=0, max_new_tokens=max_new, output_len=generated
                 )
                 self.assertEqual(adder._swa_new_tokens(req), expected)
+
+    def test_lookahead_bypasses_oversized_ignore_eos_request(self):
+        """The disabled-radix ignore_eos path must classify its initial,
+        side-effect-free KV rejection as request-local so a smaller request
+        later in the waiting queue can still be admitted."""
+        self.mock_tree_cache.disable = True
+        self.mock_token_allocator.available_size.return_value = 100
+        adder = self.create_adder(self.create_running_batch())
+        lookahead = PrefillLookahead(window=8)
+
+        def make_req(rid: str, input_len: int):
+            req = self.create_mock_req(rid, priority=0, max_new_tokens=1)
+            req.sampling_params.ignore_eos = True
+            req.origin_input_ids = list(range(input_len))
+            req.full_untruncated_fill_ids = list(range(input_len))
+            req.set_extend_range = MagicMock(
+                side_effect=lambda start, end: setattr(
+                    req, "extend_range", Range(start, end)
+                )
+            )
+            return req
+
+        oversized = make_req("oversized", 200)
+        fitting = make_req("fitting", 10)
+        results = []
+
+        for queue_index, req in enumerate([oversized, fitting]):
+            result = adder.add_one_req(
+                req,
+                has_chunked_req=False,
+                truncation_align_size=None,
+            )
+            results.append(result)
+            added = bool(adder.can_run_list) and req is adder.can_run_list[-1]
+            if result != AddReqResult.CONTINUE:
+                if lookahead.should_bypass(queue_index, result, added):
+                    continue
+                break
+
+        self.assertEqual(results[0], AddReqResult.NO_TOKEN_FOR_REQUEST)
+        self.assertEqual(results[1], AddReqResult.CONTINUE)
+        self.assertEqual(adder.can_run_list, [fitting])
+        self.assertEqual(adder.req_states, [(1.0, 10)])
+
+    def test_lookahead_does_not_bypass_ignore_eos_after_state_mutation(self):
+        """A later ignore_eos rejection has already inserted req_states and
+        must remain a batch-level NO_TOKEN result until rollback exists."""
+        self.mock_tree_cache.disable = True
+        self.mock_token_allocator.available_size.return_value = 100
+        adder = self.create_adder(self.create_running_batch())
+        req = self.create_mock_req("decode-heavy", priority=0, max_new_tokens=200)
+        req.sampling_params.ignore_eos = True
+        req.origin_input_ids = list(range(10))
+        req.full_untruncated_fill_ids = list(range(10))
+
+        result = adder.add_one_req(
+            req,
+            has_chunked_req=False,
+            truncation_align_size=None,
+        )
+
+        self.assertEqual(result, AddReqResult.NO_TOKEN)
+        self.assertEqual(adder.req_states, [(200.0, 10)])
+        self.assertFalse(
+            PrefillLookahead(window=8).should_bypass(0, result, added=False)
+        )
 
     def test_delayer_not_consulted_when_kv_budget_rejects(self):
         """A rank whose first candidate fails the KV-budget gate must NOT

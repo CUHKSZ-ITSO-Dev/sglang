@@ -39,6 +39,7 @@ from enum import Enum, auto
 from functools import lru_cache
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
 
+import msgspec
 import torch
 
 from sglang.srt.dllm.config import DllmConfig
@@ -611,8 +612,7 @@ class AddReqResult(Enum):
     OTHER = auto()  # Other reasons to stop adding requests
 
 
-@dataclass
-class PrefillLookahead:
+class PrefillLookahead(msgspec.Struct):
     """Bound the queue positions inspected after the first rejected request."""
 
     window: int
@@ -1242,7 +1242,9 @@ class PrefillAdder:
             chunk_limit=self.rem_chunk_tokens,
         )
         if not fits:
-            return AddReqResult.NO_TOKEN
+            # Admission failed before req_states or request state was mutated,
+            # so bounded lookahead may safely inspect another waiting request.
+            return AddReqResult.NO_TOKEN_FOR_REQUEST
 
         def add_req_state(r, insert_sort=False):
             new_token_ratio = (
