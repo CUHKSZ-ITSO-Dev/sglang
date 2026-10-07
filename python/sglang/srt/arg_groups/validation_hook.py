@@ -495,6 +495,8 @@ def validate_prefill_lookahead_window(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.prefill_lookahead_window < 0:
         raise ValueError("--prefill-lookahead-window must be non-negative.")
+    if cfg.prefill_lookahead_max_bypasses <= 0:
+        raise ValueError("--prefill-lookahead-max-bypasses must be positive.")
 
 
 def default_unset_prefill_decode_interval(server_args: Any):

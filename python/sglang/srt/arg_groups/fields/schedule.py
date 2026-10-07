@@ -84,10 +84,21 @@ class Schedule(msgspec.Struct):
         (
             "After a request fails prefill admission because its KV demand does "
             "not fit, inspect at most this many following waiting requests for a "
-            "smaller request that fits. Set to 0 to preserve strict queue-order "
-            "admission."
+            "smaller request that fits. With priority scheduling, lookahead stays "
+            "within the blocked request's priority class. Positions skipped for "
+            "other reasons still count toward the window. This applies to the "
+            "standard prefill scheduler, not dLLM, and may increase long-request "
+            "waiting time. Set to 0 to preserve strict queue-order admission."
         ),
     ] = 0
+    prefill_lookahead_max_bypasses: A[
+        int,
+        (
+            "The maximum number of scheduling rounds in which one request may be "
+            "bypassed by prefill lookahead. After this limit, strict queue order "
+            "is restored for that request so KV capacity can accumulate for it."
+        ),
+    ] = 8
     schedule_policy: A[
         str,
         Arg(

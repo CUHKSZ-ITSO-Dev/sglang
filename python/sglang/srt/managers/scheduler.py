@@ -1289,6 +1289,8 @@ class Scheduler(
         ] = deque()
         self.enable_continuous_input_polling = False
         self.forward_ct = 0
+        self.prefill_lookahead_bypass_total = 0
+        self.prefill_lookahead_max_wait_seconds = 0.0
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(
             flush_cache=self.flush_cache,
@@ -3959,12 +3961,40 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
-        lookahead = PrefillLookahead(get_schedule().prefill_lookahead_window)
+        schedule_config = get_schedule()
+        lookahead = PrefillLookahead(schedule_config.prefill_lookahead_window)
+        lookahead_blocked_req: Optional[Req] = None
+        initial_can_run_count = len(adder.can_run_list)
+
+        def mark_batch_full_after_failed_lookahead() -> None:
+            if (
+                self.enable_hierarchical_cache
+                or self.enable_lmcache
+                or self.enable_unified_cache_external_linker
+            ):
+                running_batch.batch_is_full = bool(adder.can_run_list) or (
+                    not running_batch.is_empty()
+                )
+            else:
+                running_batch.batch_is_full = True
+
         # Get requests from the waiting queue to a new prefill batch
         for queue_index, req in enumerate(self.waiting_queue):
             if not lookahead.allows(queue_index):
-                if not adder.can_run_list and not running_batch.is_empty():
-                    running_batch.batch_is_full = True
+                if len(adder.can_run_list) == initial_can_run_count:
+                    mark_batch_full_after_failed_lookahead()
+                break
+
+            # Priority ordering remains strict across priority classes. A
+            # lookahead window may only backfill requests from the same class
+            # as the first blocked request.
+            if (
+                lookahead_blocked_req is not None
+                and self.enable_priority_scheduling
+                and req.priority != lookahead_blocked_req.priority
+            ):
+                if len(adder.can_run_list) == initial_can_run_count:
+                    mark_batch_full_after_failed_lookahead()
                 break
 
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
@@ -4038,6 +4068,8 @@ class Scheduler(
             )
 
             added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
+            if added:
+                req.prefill_lookahead_bypass_count = 0
             if self.enable_lora and added:
                 running_loras.add(req.lora_id)
 
@@ -4057,25 +4089,54 @@ class Scheduler(
                         )
                         req.kv.mamba_pool_idx = None
 
-                if lookahead.should_bypass(queue_index, res, added):
-                    continue
+                if lookahead.can_bypass(res, added):
+                    bypass_count = getattr(req, "prefill_lookahead_bypass_count", 0)
+                    if (
+                        bypass_count < schedule_config.prefill_lookahead_max_bypasses
+                        and lookahead.start(queue_index)
+                    ):
+                        req.prefill_lookahead_bypass_count = bypass_count + 1
+                        self.prefill_lookahead_bypass_total = (
+                            getattr(self, "prefill_lookahead_bypass_total", 0) + 1
+                        )
+                        wait_queue_entry_time = getattr(
+                            req.time_stats, "wait_queue_entry_time", 0.0
+                        )
+                        if wait_queue_entry_time > 0:
+                            self.prefill_lookahead_max_wait_seconds = max(
+                                getattr(
+                                    self,
+                                    "prefill_lookahead_max_wait_seconds",
+                                    0.0,
+                                ),
+                                time.monotonic() - wait_queue_entry_time,
+                            )
+                        if self.prefill_lookahead_bypass_total % 128 == 0:
+                            logger.info(
+                                "Prefill lookahead: bypasses=%s, "
+                                "max_bypassed_wait_seconds=%.3f",
+                                self.prefill_lookahead_bypass_total,
+                                self.prefill_lookahead_max_wait_seconds,
+                            )
+                        if lookahead_blocked_req is None:
+                            lookahead_blocked_req = req
+                        continue
 
                 if res in (
                     AddReqResult.NO_TOKEN,
                     AddReqResult.NO_TOKEN_FOR_REQUEST,
                 ):
-                    if (
-                        self.enable_hierarchical_cache
-                        or self.enable_lmcache
-                        or self.enable_unified_cache_external_linker
-                    ):
-                        # Set batch_is_full after making sure there are requests that can be served
-                        running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
-                            not running_batch.is_empty()
-                        )
-                    else:
-                        running_batch.batch_is_full = True
+                    mark_batch_full_after_failed_lookahead()
                 break
+
+        # The queue may end before the window boundary. If every inspected
+        # candidate was rejected, avoid repeating the same work every decode
+        # step until the running batch releases KV capacity.
+        if (
+            lookahead_blocked_req is not None
+            and len(adder.can_run_list) == initial_can_run_count
+        ):
+            mark_batch_full_after_failed_lookahead()
 
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()

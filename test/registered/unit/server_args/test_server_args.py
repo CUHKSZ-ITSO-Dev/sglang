@@ -337,20 +337,44 @@ class TestPrepareServerArgs(CustomTestCase):
             ServerArgs(model_path="dummy").prefill_lookahead_window,
             0,
         )
+        self.assertEqual(
+            ServerArgs(model_path="dummy").prefill_lookahead_max_bypasses,
+            8,
+        )
 
-        args = ServerArgs(model_path="dummy", prefill_lookahead_window=16)
+        args = ServerArgs(
+            model_path="dummy",
+            prefill_lookahead_window=16,
+            prefill_lookahead_max_bypasses=4,
+        )
         args.resolve_once()
         self.assertEqual(args.prefill_lookahead_window, 16)
+        self.assertEqual(args.prefill_lookahead_max_bypasses, 4)
 
         cli_args = prepare_server_args(
-            ["--model-path", "dummy", "--prefill-lookahead-window", "8"]
+            [
+                "--model-path",
+                "dummy",
+                "--prefill-lookahead-window",
+                "8",
+                "--prefill-lookahead-max-bypasses",
+                "3",
+            ]
         )
         self.assertEqual(cli_args.prefill_lookahead_window, 8)
+        self.assertEqual(cli_args.prefill_lookahead_max_bypasses, 3)
 
         with self.assertRaisesRegex(
             ValueError, "--prefill-lookahead-window must be non-negative"
         ):
             ServerArgs(model_path="dummy", prefill_lookahead_window=-1).resolve_once()
+
+        with self.assertRaisesRegex(
+            ValueError, "--prefill-lookahead-max-bypasses must be positive"
+        ):
+            ServerArgs(
+                model_path="dummy", prefill_lookahead_max_bypasses=0
+            ).resolve_once()
 
     def test_sampling_mask_max_tokens(self):
         self.assertEqual(ServerArgs(model_path="dummy").sampling_mask_max_tokens, 4096)

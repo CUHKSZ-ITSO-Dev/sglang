@@ -628,14 +628,9 @@ class PrefillLookahead(msgspec.Struct):
             self.stop_index = rejected_index + 1 + self.window
         return True
 
-    def should_bypass(
-        self, queue_index: int, result: AddReqResult, added: bool
-    ) -> bool:
-        return (
-            not added
-            and result == AddReqResult.NO_TOKEN_FOR_REQUEST
-            and self.start(queue_index)
-        )
+    @staticmethod
+    def can_bypass(result: AddReqResult, added: bool) -> bool:
+        return not added and result == AddReqResult.NO_TOKEN_FOR_REQUEST
 
 
 @dataclass(frozen=True, slots=True)
@@ -1244,7 +1239,11 @@ class PrefillAdder:
         if not fits:
             # Admission failed before req_states or request state was mutated,
             # so bounded lookahead may safely inspect another waiting request.
-            return AddReqResult.NO_TOKEN_FOR_REQUEST
+            return (
+                AddReqResult.NO_TOKEN_FOR_REQUEST
+                if self.memory_budget.has_capacity()
+                else AddReqResult.NO_TOKEN
+            )
 
         def add_req_state(r, insert_sort=False):
             new_token_ratio = (
@@ -1523,7 +1522,11 @@ class PrefillAdder:
         if not can_admit:
             # No state has been committed yet, so the scheduler may safely try
             # another waiting request when bounded lookahead is enabled.
-            return AddReqResult.NO_TOKEN_FOR_REQUEST
+            return (
+                AddReqResult.NO_TOKEN_FOR_REQUEST
+                if self.memory_budget.has_capacity()
+                else AddReqResult.NO_TOKEN
+            )
 
         # Without chunking, allow the first request even above the input cap.
         if (

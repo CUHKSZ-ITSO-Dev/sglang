@@ -55,12 +55,13 @@ class TestPrefillLookahead(CustomTestCase):
         lookahead = PrefillLookahead(window=2)
 
         self.assertFalse(
-            lookahead.should_bypass(3, AddReqResult.NO_TOKEN_FOR_REQUEST, added=True)
+            lookahead.can_bypass(AddReqResult.NO_TOKEN_FOR_REQUEST, added=True)
         )
-        self.assertFalse(lookahead.should_bypass(3, AddReqResult.NO_TOKEN, added=False))
+        self.assertFalse(lookahead.can_bypass(AddReqResult.NO_TOKEN, added=False))
         self.assertTrue(
-            lookahead.should_bypass(3, AddReqResult.NO_TOKEN_FOR_REQUEST, added=False)
+            lookahead.can_bypass(AddReqResult.NO_TOKEN_FOR_REQUEST, added=False)
         )
+        self.assertIsNone(lookahead.stop_index)
 
 
 class TestSchedulePolicyHRRN(CustomTestCase):
