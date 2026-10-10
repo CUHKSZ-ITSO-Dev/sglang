@@ -3839,6 +3839,28 @@ class Scheduler(
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
+    def _record_prefill_lookahead_bypasses(self, reqs: List[Req]) -> None:
+        """Record requests that a later request actually overtook this round."""
+        now = time.monotonic()
+        for req in reqs:
+            req.prefill_lookahead_bypass_count += 1
+            self.prefill_lookahead_bypass_total += 1
+            wait_queue_entry_time = req.time_stats.wait_queue_entry_time
+            if wait_queue_entry_time > 0:
+                self.prefill_lookahead_max_wait_seconds = max(
+                    self.prefill_lookahead_max_wait_seconds,
+                    now - wait_queue_entry_time,
+                )
+
+            if self.prefill_lookahead_bypass_total % 128 == 0:
+                logger.info(
+                    "Prefill lookahead: bypasses=%s, "
+                    "max_bypassed_wait_seconds=%.3f",
+                    self.prefill_lookahead_bypass_total,
+                    self.prefill_lookahead_max_wait_seconds,
+                )
+                self.prefill_lookahead_max_wait_seconds = 0.0
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -3964,6 +3986,7 @@ class Scheduler(
         schedule_config = get_schedule()
         lookahead = PrefillLookahead(schedule_config.prefill_lookahead_window)
         lookahead_blocked_req: Optional[Req] = None
+        pending_bypassed_reqs: List[Req] = []
         initial_can_run_count = len(adder.can_run_list)
 
         def mark_batch_full_after_failed_lookahead() -> None:
@@ -4031,6 +4054,17 @@ class Scheduler(
                 ):
                     break
 
+            # Once lookahead has started, do not poll an ongoing HiCache L3
+            # prefetch for a later candidate. check_prefetch_progress() may
+            # terminate an incomplete prefetch, even when that candidate is
+            # subsequently rejected and left in the waiting queue.
+            if (
+                lookahead_blocked_req is not None
+                and self.enable_hicache_storage
+                and self.tree_cache.has_ongoing_prefetch(req.cache_request_handle)
+            ):
+                continue
+
             if self.enable_hicache_storage or self.enable_lmcache:
                 prefetch_done = self.tree_cache.check_prefetch_progress(
                     req.cache_request_handle
@@ -4070,6 +4104,9 @@ class Scheduler(
             added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
             if added:
                 req.prefill_lookahead_bypass_count = 0
+                if pending_bypassed_reqs:
+                    self._record_prefill_lookahead_bypasses(pending_bypassed_reqs)
+                    pending_bypassed_reqs.clear()
             if self.enable_lora and added:
                 running_loras.add(req.lora_id)
 
@@ -4090,34 +4127,12 @@ class Scheduler(
                         req.kv.mamba_pool_idx = None
 
                 if lookahead.can_bypass(res, added):
-                    bypass_count = getattr(req, "prefill_lookahead_bypass_count", 0)
+                    bypass_count = req.prefill_lookahead_bypass_count
                     if (
                         bypass_count < schedule_config.prefill_lookahead_max_bypasses
                         and lookahead.start(queue_index)
                     ):
-                        req.prefill_lookahead_bypass_count = bypass_count + 1
-                        self.prefill_lookahead_bypass_total = (
-                            getattr(self, "prefill_lookahead_bypass_total", 0) + 1
-                        )
-                        wait_queue_entry_time = getattr(
-                            req.time_stats, "wait_queue_entry_time", 0.0
-                        )
-                        if wait_queue_entry_time > 0:
-                            self.prefill_lookahead_max_wait_seconds = max(
-                                getattr(
-                                    self,
-                                    "prefill_lookahead_max_wait_seconds",
-                                    0.0,
-                                ),
-                                time.monotonic() - wait_queue_entry_time,
-                            )
-                        if self.prefill_lookahead_bypass_total % 128 == 0:
-                            logger.info(
-                                "Prefill lookahead: bypasses=%s, "
-                                "max_bypassed_wait_seconds=%.3f",
-                                self.prefill_lookahead_bypass_total,
-                                self.prefill_lookahead_max_wait_seconds,
-                            )
+                        pending_bypassed_reqs.append(req)
                         if lookahead_blocked_req is None:
                             lookahead_blocked_req = req
                         continue

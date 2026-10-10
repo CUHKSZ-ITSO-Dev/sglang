@@ -141,7 +141,12 @@ class TestPrefillAdder(CustomTestCase):
         req.token_indices_to_pool = None
         req.beam_group = None
         req.prefill_lookahead_bypass_count = 0
-        req.kv.holds_mamba = False
+        req.kv = SimpleNamespace(
+            holds_mamba=False,
+            mamba_cow_src_index=None,
+            mamba_needs_clear=False,
+            mamba_pool_idx=None,
+        )
         req.init_next_round_input = MagicMock()
         req.set_extend_range = MagicMock(
             side_effect=lambda start, end: setattr(
@@ -193,6 +198,8 @@ class TestPrefillAdder(CustomTestCase):
         scheduler.enable_lmcache = False
         scheduler.enable_hierarchical_cache = False
         scheduler.enable_unified_cache_external_linker = False
+        scheduler.prefill_lookahead_bypass_total = 0
+        scheduler.prefill_lookahead_max_wait_seconds = 0.0
         scheduler.truncation_align_size = None
         scheduler.model_config = MagicMock()
         scheduler.enable_overlap = False
@@ -922,7 +929,7 @@ class TestPrefillAdder(CustomTestCase):
             req, has_chunked_req=False, truncation_align_size=None
         )
 
-        self.assertEqual(result, AddReqResult.NO_TOKEN)
+        self.assertEqual(result, AddReqResult.NO_TOKEN_FOR_REQUEST)
         self.assertEqual(adder.can_run_list, [])
         req.set_extend_range.assert_not_called()
 
@@ -1581,6 +1588,21 @@ class TestPrefillAdder(CustomTestCase):
 
         self.assertEqual(result, AddReqResult.NO_TOKEN)
 
+    def test_default_radix_path_reports_global_kv_exhaustion(self):
+        self.mock_tree_cache.disable = False
+        self.mock_token_allocator.available_size.return_value = 0
+        self.mock_token_allocator.full_available_size.return_value = 0
+        adder = self.create_adder(self.create_running_batch())
+        req = self._create_delayer_req(10)
+
+        result = adder.add_one_req(
+            req,
+            has_chunked_req=False,
+            truncation_align_size=None,
+        )
+
+        self.assertEqual(result, AddReqResult.NO_TOKEN)
+
     def test_scheduler_loop_preserves_strict_mode_and_backfills_when_enabled(self):
         for window, expected_admitted in ((0, []), (1, ["small"])):
             with self.subTest(window=window):
@@ -1603,6 +1625,55 @@ class TestPrefillAdder(CustomTestCase):
                 else:
                     self.assertEqual(scheduler.waiting_queue, [big])
                     self.assertEqual(big.prefill_lookahead_bypass_count, 1)
+
+    def test_scheduler_loop_counts_only_actual_bypasses(self):
+        big = self.create_lookahead_req("big", input_len=200)
+        scheduler, running = self.create_lookahead_scheduler([big])
+
+        _, running, admitted = self.run_lookahead_scheduler(
+            scheduler,
+            running,
+            window=8,
+            max_bypasses=8,
+        )
+
+        self.assertEqual(admitted, [])
+        self.assertEqual(big.prefill_lookahead_bypass_count, 0)
+        self.assertEqual(scheduler.prefill_lookahead_bypass_total, 0)
+
+    def test_lookahead_wait_metric_resets_after_periodic_log(self):
+        blocked = self.create_lookahead_req("blocked", input_len=200)
+        blocked.time_stats.wait_queue_entry_time = 90.0
+        scheduler, _ = self.create_lookahead_scheduler([blocked])
+        scheduler.prefill_lookahead_bypass_total = 127
+        scheduler.prefill_lookahead_max_wait_seconds = 3.0
+
+        with patch("sglang.srt.managers.scheduler.time.monotonic", return_value=100.0):
+            scheduler._record_prefill_lookahead_bypasses([blocked])
+
+        self.assertEqual(blocked.prefill_lookahead_bypass_count, 1)
+        self.assertEqual(scheduler.prefill_lookahead_bypass_total, 128)
+        self.assertEqual(scheduler.prefill_lookahead_max_wait_seconds, 0.0)
+
+    def test_scheduler_loop_stops_at_window_boundary(self):
+        big0 = self.create_lookahead_req("big-0", input_len=200)
+        big1 = self.create_lookahead_req("big-1", input_len=200)
+        small = self.create_lookahead_req("small", input_len=10)
+        scheduler, running = self.create_lookahead_scheduler([big0, big1, small])
+
+        _, running, admitted = self.run_lookahead_scheduler(
+            scheduler,
+            running,
+            window=1,
+            max_bypasses=8,
+        )
+
+        self.assertEqual(admitted, [])
+        self.assertEqual(scheduler.waiting_queue, [big0, big1, small])
+        self.assertEqual(big0.prefill_lookahead_bypass_count, 0)
+        self.assertEqual(big1.prefill_lookahead_bypass_count, 0)
+        self.assertTrue(running.batch_is_full)
+        small.init_next_round_input.assert_not_called()
 
     def test_scheduler_loop_stops_after_max_bypasses(self):
         big = self.create_lookahead_req("big", input_len=200)
@@ -1634,6 +1705,17 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(big.prefill_lookahead_bypass_count, 2)
         self.assertTrue(running.batch_is_full)
         blocked_small.init_next_round_input.assert_not_called()
+
+        self.mock_token_allocator.available_size.return_value = 1000
+        running.batch_is_full = False
+        _, _, admitted = self.run_lookahead_scheduler(
+            scheduler,
+            running,
+            window=1,
+            max_bypasses=2,
+        )
+        self.assertEqual(admitted, [big, blocked_small])
+        self.assertEqual(big.prefill_lookahead_bypass_count, 0)
 
     def test_scheduler_loop_marks_full_when_queue_ends_inside_window(self):
         big0 = self.create_lookahead_req("big-0", input_len=200)
@@ -1730,6 +1812,41 @@ class TestPrefillAdder(CustomTestCase):
 
         self.assertEqual(admitted, [])
         self.assertFalse(running.batch_is_full)
+
+    def test_scheduler_loop_does_not_terminate_bypassed_hicache_prefetch(self):
+        big = self.create_lookahead_req("big", input_len=200)
+        prefetching = self.create_lookahead_req("prefetching", input_len=10)
+        scheduler, running = self.create_lookahead_scheduler([big, prefetching])
+        scheduler.enable_hicache_storage = True
+        self.mock_tree_cache.has_ongoing_prefetch.side_effect = (
+            lambda handle: handle == prefetching.cache_request_handle
+        )
+
+        _, running, admitted = self.run_lookahead_scheduler(
+            scheduler,
+            running,
+            window=1,
+            max_bypasses=8,
+        )
+
+        self.assertEqual(admitted, [])
+        self.assertTrue(running.batch_is_full)
+        self.mock_tree_cache.check_prefetch_progress.assert_called_once_with(
+            big.cache_request_handle
+        )
+        prefetching.init_next_round_input.assert_not_called()
+
+    def test_dllm_request_local_rejection_marks_batch_full(self):
+        req = self.create_lookahead_req("dllm", input_len=10)
+        scheduler, running = self.create_lookahead_scheduler([req])
+        adder = MagicMock()
+        adder.can_run_list = []
+        adder.add_one_req.return_value = AddReqResult.NO_TOKEN_FOR_REQUEST
+
+        result = scheduler.process_dllm_incoming_reqs(adder, [req], running)
+
+        self.assertEqual(result, AddReqResult.NO_TOKEN_FOR_REQUEST)
+        self.assertTrue(running.batch_is_full)
 
     def test_delayer_not_consulted_when_kv_budget_rejects(self):
         """A rank whose first candidate fails the KV-budget gate must NOT

@@ -94,9 +94,11 @@ class Schedule(msgspec.Struct):
     prefill_lookahead_max_bypasses: A[
         int,
         (
-            "The maximum number of scheduling rounds in which one request may be "
-            "bypassed by prefill lookahead. After this limit, strict queue order "
-            "is restored for that request so KV capacity can accumulate for it."
+            "The maximum number of scheduling rounds in which a later request may "
+            "actually be admitted ahead of one blocked request. Rounds with no "
+            "later admission do not consume this limit. After the limit, strict "
+            "queue order is restored so KV capacity can accumulate for the blocked "
+            "request."
         ),
     ] = 8
     schedule_policy: A[
