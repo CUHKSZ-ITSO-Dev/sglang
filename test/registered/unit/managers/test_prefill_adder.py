@@ -141,6 +141,7 @@ class TestPrefillAdder(CustomTestCase):
         req.token_indices_to_pool = None
         req.beam_group = None
         req.prefill_lookahead_bypass_count = 0
+        req.storage_prefetch_last_match_len = None
         req.kv = SimpleNamespace(
             holds_mamba=False,
             mamba_cow_src_index=None,
@@ -1640,6 +1641,26 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(admitted, [])
         self.assertEqual(big.prefill_lookahead_bypass_count, 0)
         self.assertEqual(scheduler.prefill_lookahead_bypass_total, 0)
+
+    def test_scheduler_loop_counts_once_when_multiple_requests_overtake(self):
+        big = self.create_lookahead_req("big", input_len=200)
+        small0 = self.create_lookahead_req("small-0", input_len=10)
+        small1 = self.create_lookahead_req("small-1", input_len=10)
+        scheduler, running = self.create_lookahead_scheduler(
+            [big, small0, small1]
+        )
+
+        _, _, admitted = self.run_lookahead_scheduler(
+            scheduler,
+            running,
+            window=8,
+            max_bypasses=8,
+        )
+
+        self.assertEqual(admitted, [small0, small1])
+        self.assertEqual(scheduler.waiting_queue, [big])
+        self.assertEqual(big.prefill_lookahead_bypass_count, 1)
+        self.assertEqual(scheduler.prefill_lookahead_bypass_total, 1)
 
     def test_lookahead_wait_metric_resets_after_periodic_log(self):
         blocked = self.create_lookahead_req("blocked", input_len=200)
