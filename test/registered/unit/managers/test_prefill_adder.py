@@ -1696,6 +1696,24 @@ class TestPrefillAdder(CustomTestCase):
         self.assertTrue(running.batch_is_full)
         small.init_next_round_input.assert_not_called()
 
+    def test_scheduler_loop_backfill_at_window_boundary_keeps_batch_open(self):
+        big0 = self.create_lookahead_req("big-0", input_len=200)
+        small = self.create_lookahead_req("small", input_len=10)
+        big1 = self.create_lookahead_req("big-1", input_len=200)
+        scheduler, running = self.create_lookahead_scheduler([big0, small, big1])
+
+        _, running, admitted = self.run_lookahead_scheduler(
+            scheduler,
+            running,
+            window=1,
+            max_bypasses=8,
+        )
+
+        self.assertEqual(admitted, [small])
+        self.assertEqual(scheduler.waiting_queue, [big0, big1])
+        self.assertFalse(running.batch_is_full)
+        big1.init_next_round_input.assert_not_called()
+
     def test_scheduler_loop_stops_after_max_bypasses(self):
         big = self.create_lookahead_req("big", input_len=200)
         scheduler, running = self.create_lookahead_scheduler([big])
@@ -1792,6 +1810,64 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(scheduler.waiting_queue, [high, low])
         self.assertTrue(running.batch_is_full)
         low.init_next_round_input.assert_not_called()
+
+    def test_scheduler_loop_backfill_before_priority_boundary_keeps_batch_open(self):
+        high_big = self.create_lookahead_req("high-big", input_len=200, priority=10)
+        high_small = self.create_lookahead_req(
+            "high-small", input_len=10, priority=10
+        )
+        low = self.create_lookahead_req("low", input_len=10, priority=1)
+        scheduler, running = self.create_lookahead_scheduler(
+            [high_big, high_small, low]
+        )
+        scheduler.enable_priority_scheduling = True
+
+        _, running, admitted = self.run_lookahead_scheduler(
+            scheduler,
+            running,
+            window=8,
+            max_bypasses=8,
+        )
+
+        self.assertEqual(admitted, [high_small])
+        self.assertEqual(scheduler.waiting_queue, [high_big, low])
+        self.assertFalse(running.batch_is_full)
+        low.init_next_round_input.assert_not_called()
+
+    def test_scheduler_loop_stops_lookahead_after_priority_preemption(self):
+        big0 = self.create_lookahead_req("big-0", input_len=200, priority=10)
+        big1 = self.create_lookahead_req("big-1", input_len=200, priority=10)
+        running_req = self.create_mock_req(
+            "running", priority=0, max_new_tokens=1
+        )
+        running = self.create_running_batch([running_req])
+        scheduler, running = self.create_lookahead_scheduler(
+            [big0, big1], running_batch=running
+        )
+        scheduler.enable_priority_preemption = True
+        scheduler.get_num_allocatable_reqs.return_value = 0
+
+        def record_preemption(adder, _req):
+            adder.preempt_list.append(running_req)
+            return True
+
+        with patch.object(
+            PrefillAdder,
+            "preempt_to_schedule",
+            autospec=True,
+            side_effect=record_preemption,
+        ) as preempt:
+            _, _, admitted = self.run_lookahead_scheduler(
+                scheduler,
+                running,
+                window=8,
+                max_bypasses=8,
+            )
+
+        self.assertEqual(admitted, [])
+        self.assertEqual(preempt.call_count, 1)
+        self.assertEqual(big0.prefill_lookahead_bypass_count, 0)
+        big1.init_next_round_input.assert_not_called()
 
     def test_scheduler_loop_does_not_record_bypassed_lora_as_running(self):
         big = self.create_lookahead_req("big", input_len=200)

@@ -3853,12 +3853,17 @@ class Scheduler(
                 )
 
             if self.prefill_lookahead_bypass_total % 128 == 0:
-                logger.info(
-                    "Prefill lookahead: bypasses=%s, "
-                    "max_bypassed_wait_seconds=%.3f",
-                    self.prefill_lookahead_bypass_total,
-                    self.prefill_lookahead_max_wait_seconds,
-                )
+                if (
+                    get_parallel().pp_rank == 0
+                    and get_parallel().attn_tp_rank == 0
+                    and get_parallel().attn_cp_rank == 0
+                ):
+                    logger.info(
+                        "Prefill lookahead: bypasses=%s, "
+                        "max_bypassed_wait_seconds=%.3f",
+                        self.prefill_lookahead_bypass_total,
+                        self.prefill_lookahead_max_wait_seconds,
+                    )
                 self.prefill_lookahead_max_wait_seconds = 0.0
 
     def _get_new_batch_prefill_raw(
@@ -4048,11 +4053,15 @@ class Scheduler(
                 if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
                     running_batch.batch_is_full = True
 
+            preempt_list_size_before = len(adder.preempt_list)
             if running_batch.batch_is_full:
                 if not self.enable_priority_preemption or not adder.preempt_to_schedule(
                     req
                 ):
                     break
+            candidate_triggered_preemption = (
+                len(adder.preempt_list) > preempt_list_size_before
+            )
 
             # Once lookahead has started, do not poll an ongoing HiCache L3
             # prefetch for a later candidate. check_prefetch_progress() may
@@ -4126,7 +4135,12 @@ class Scheduler(
                         )
                         req.kv.mamba_pool_idx = None
 
-                if lookahead.can_bypass(res, added):
+                # A failed candidate that already preempted running requests
+                # must end this scheduling pass. Continuing lookahead could
+                # preempt more requests while no replacement is admitted.
+                if not candidate_triggered_preemption and lookahead.can_bypass(
+                    res, added
+                ):
                     bypass_count = req.prefill_lookahead_bypass_count
                     if (
                         bypass_count < schedule_config.prefill_lookahead_max_bypasses

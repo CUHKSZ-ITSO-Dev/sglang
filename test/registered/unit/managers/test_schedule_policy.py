@@ -30,6 +30,11 @@ def _make_req(rid, origin_input_text, origin_input_ids, sampling_params=None, **
 
 
 class TestPrefillLookahead(CustomTestCase):
+    def test_req_bypass_count_defaults_to_zero(self):
+        req = _make_req("req", "a", [1])
+
+        self.assertEqual(req.prefill_lookahead_bypass_count, 0)
+
     def test_disabled_window_never_starts(self):
         lookahead = PrefillLookahead(window=0)
 
