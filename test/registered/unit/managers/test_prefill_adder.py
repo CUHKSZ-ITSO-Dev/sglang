@@ -29,7 +29,7 @@ from sglang.srt.mem_cache.prefill_budget import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils.common import Range
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -1669,9 +1669,45 @@ class TestPrefillAdder(CustomTestCase):
         scheduler.prefill_lookahead_bypass_total = 127
         scheduler.prefill_lookahead_max_wait_seconds = 3.0
 
-        with patch("sglang.srt.managers.scheduler.time.monotonic", return_value=100.0):
+        with (
+            get_parallel().override(
+                pp_rank=0,
+                attn_tp_rank=0,
+                attn_cp_rank=0,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler.time.monotonic",
+                return_value=100.0,
+            ),
+        ):
             scheduler._record_prefill_lookahead_bypasses([blocked])
 
+        self.assertEqual(blocked.prefill_lookahead_bypass_count, 1)
+        self.assertEqual(scheduler.prefill_lookahead_bypass_total, 128)
+        self.assertEqual(scheduler.prefill_lookahead_max_wait_seconds, 0.0)
+
+    def test_lookahead_wait_metric_does_not_log_on_nonzero_rank(self):
+        blocked = self.create_lookahead_req("blocked", input_len=200)
+        blocked.time_stats.wait_queue_entry_time = 90.0
+        scheduler, _ = self.create_lookahead_scheduler([blocked])
+        scheduler.prefill_lookahead_bypass_total = 127
+        scheduler.prefill_lookahead_max_wait_seconds = 3.0
+
+        with (
+            get_parallel().override(
+                pp_rank=0,
+                attn_tp_rank=1,
+                attn_cp_rank=0,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler.time.monotonic",
+                return_value=100.0,
+            ),
+            patch("sglang.srt.managers.scheduler.logger.info") as log_info,
+        ):
+            scheduler._record_prefill_lookahead_bypasses([blocked])
+
+        log_info.assert_not_called()
         self.assertEqual(blocked.prefill_lookahead_bypass_count, 1)
         self.assertEqual(scheduler.prefill_lookahead_bypass_total, 128)
         self.assertEqual(scheduler.prefill_lookahead_max_wait_seconds, 0.0)
