@@ -1697,6 +1697,9 @@ class TestPrefillAdder(CustomTestCase):
             get_parallel().override(
                 pp_rank=0,
                 attn_tp_rank=1,
+                attn_tp_size=2,
+                tp_size=2,
+                moe_tp_size=2,
                 attn_cp_rank=0,
             ),
             patch(
