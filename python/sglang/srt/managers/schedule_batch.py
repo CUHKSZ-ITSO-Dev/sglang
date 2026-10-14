@@ -1154,6 +1154,9 @@ class Req(ReqDllmMixin):
         self.eos_token_ids = eos_token_ids
         self.vocab_size = vocab_size
         self.priority = priority
+        # Persist across scheduler rounds so bounded lookahead cannot starve a
+        # request by resetting its bypass allowance on every pass.
+        self.prefill_lookahead_bypass_count = 0
 
         # For incremental decoding
         # ----- | --------- read_ids -------|

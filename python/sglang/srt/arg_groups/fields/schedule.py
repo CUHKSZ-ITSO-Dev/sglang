@@ -79,6 +79,28 @@ class Schedule(msgspec.Struct):
         Optional[int],
         "The maximum number of requests in a prefill batch. If not specified, there is no limit.",
     ] = None
+    prefill_lookahead_window: A[
+        int,
+        (
+            "After a request fails prefill admission because its KV demand does "
+            "not fit, inspect at most this many following waiting requests for a "
+            "smaller request that fits. With priority scheduling, lookahead stays "
+            "within the blocked request's priority class. Positions skipped for "
+            "other reasons still count toward the window. This applies to the "
+            "standard prefill scheduler, not dLLM, and may increase long-request "
+            "waiting time. Set to 0 to preserve strict queue-order admission."
+        ),
+    ] = 0
+    prefill_lookahead_max_bypasses: A[
+        int,
+        (
+            "The maximum number of scheduling rounds in which a later request may "
+            "actually be admitted ahead of one blocked request. Rounds with no "
+            "later admission do not consume this limit. After the limit, strict "
+            "queue order is restored so KV capacity can accumulate for the blocked "
+            "request."
+        ),
+    ] = 8
     schedule_policy: A[
         str,
         Arg(
