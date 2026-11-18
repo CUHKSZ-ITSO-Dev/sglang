@@ -5,18 +5,25 @@ from unittest.mock import MagicMock, patch
 import torch
 
 import sglang.srt.managers.schedule_policy as schedule_policy
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
+    PrefillLookahead,
     SchedulePolicy,
     estimate_prefill_extend_tile_metrics,
 )
+from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
+    DecLockRefParams,
     DecLockRefResult,
     IncLockRefResult,
+    TreeLock,
 )
 from sglang.srt.mem_cache.page_interleave import PageShardSpec, make_page_shard_spec
 from sglang.srt.mem_cache.prefill_budget import (
@@ -25,10 +32,10 @@ from sglang.srt.mem_cache.prefill_budget import (
     estimate_swa_kv_tokens,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.srt.utils.common import Range
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -69,6 +76,13 @@ class TestPrefillAdder(CustomTestCase):
         tree_cache.disable = False
         tree_cache.inc_lock_ref.return_value = IncLockRefResult()
         tree_cache.dec_lock_ref.return_value = DecLockRefResult()
+        # Route lock/unlock through inc/dec_lock_ref so tests can hook those.
+        tree_cache.lock.side_effect = lambda node: TreeLock(
+            node, tree_cache.inc_lock_ref(node).to_dec_params()
+        )
+        tree_cache.unlock.side_effect = lambda lock: (
+            lock is not None and tree_cache.dec_lock_ref(lock.node, lock.receipt)
+        )
         tree_cache.buffer_pipeline = None
         return tree_cache
 
@@ -86,6 +100,7 @@ class TestPrefillAdder(CustomTestCase):
         allocator.available_size.return_value = available_size
         allocator.size_swa = size_swa
         allocator.swa_req_ring = False
+        allocator.request_slot_reserve.return_value = 0
         allocator.create_prefill_budget.side_effect = lambda tree_cache, **kwargs: (
             PrefillBudget(allocator, tree_cache, **kwargs)
         )
@@ -109,17 +124,24 @@ class TestPrefillAdder(CustomTestCase):
 
     def create_mock_req(self, rid, priority, max_new_tokens, output_len=0, wait_time=0):
         req = MagicMock(spec=Req)
+        req.kv = SimpleNamespace(req_pool_idx=None)
         req.rid = str(rid)
         req.cache_request_handle = CacheRequestHandle(req.rid, 0)
         req.priority = priority
-        req.prefix_indices = []
+        req.prefix_len = 0
+        # A spec=Req mock gets a per-instance class; derive extend_len like Req.
+        type(req).extend_len = Req.extend_len
+        req.extend_end = None
         req.full_untruncated_fill_ids = []
         req.output_ids = [0] * output_len
-        req.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
+        req.sampling_params = SimpleNamespace(
+            max_new_tokens=max_new_tokens, ignore_eos=False
+        )
         req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
         req.retracted_stain = False
         req.host_hit_length = 0
         req.swa_host_hit_length = 0
+        req.mamba_host_hit_length = 0
         req.storage_hit_length = 0
         req.storage_hit_start = None
         req.host_hit_is_storage = False
@@ -129,6 +151,110 @@ class TestPrefillAdder(CustomTestCase):
         req.finished.return_value = False
         req.needs_host_load_back.return_value = False
         return req
+
+    def create_lookahead_req(self, rid: str, input_len: int, priority: int = 0):
+        req = self.create_mock_req(rid, priority, max_new_tokens=1)
+        req.sampling_params.ignore_eos = True
+        req.origin_input_ids = list(range(input_len))
+        req.full_untruncated_fill_ids = list(range(input_len))
+        req.token_indices_to_pool = None
+        req.beam_group = None
+        req.prefill_lookahead_bypass_count = 0
+        req.storage_prefetch_last_match_len = None
+        req.kv = SimpleNamespace(
+            holds_mamba=False,
+            mamba_cow_src_index=None,
+            mamba_needs_clear=False,
+            mamba_pool_idx=None,
+        )
+        req.init_next_round_input = MagicMock()
+        return req
+
+    def create_lookahead_scheduler(self, waiting_queue, running_batch=None):
+        self.mock_tree_cache.disable = True
+        self.mock_tree_cache.buffer_pipeline = None
+        self.mock_tree_cache.storage_prefetch_retries = None
+        self.mock_tree_cache.check_prefetch_progress.return_value = True
+        self.mock_tree_cache.pop_prefetch_loaded_span.return_value = (0, 0)
+        self.mock_token_allocator.available_size.return_value = 100
+        self.mock_token_allocator.page_size = 1
+
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.grammar_manager = MagicMock()
+        scheduler.grammar_manager.has_waiting_grammars.return_value = False
+        scheduler.enable_priority_preemption = False
+        scheduler.enable_priority_scheduling = False
+        scheduler.is_hybrid_swa = False
+        scheduler.waiting_queue = list(waiting_queue)
+        scheduler.chunked_req = None
+        scheduler.min_free_slots_delayer = None
+        scheduler.get_num_allocatable_reqs = MagicMock(return_value=100)
+        scheduler.policy = MagicMock()
+        scheduler.processed_tokens_counter = 0
+        scheduler.chunked_prefill_size = None
+        scheduler.dynamic_chunk_sizer = None
+        scheduler.tp_worker = MagicMock()
+        scheduler.tp_worker.model_runner.attn_backend = SimpleNamespace()
+        scheduler.tp_worker.model_runner.prefill_aware_swa = False
+        scheduler.page_size = 1
+        scheduler.tree_cache = self.mock_tree_cache
+        scheduler.token_to_kv_pool_allocator = self.mock_token_allocator
+        scheduler.new_token_ratio_tracker = SimpleNamespace(current=1.0)
+        scheduler.max_prefill_tokens = 10_000
+        scheduler.is_mixed_chunk = False
+        scheduler.priority_scheduling_preemption_threshold = 0
+        scheduler.max_prefill_bs = 100
+        scheduler.max_running_requests = 100
+        scheduler.dllm_config = None
+        scheduler.enable_lora = False
+        scheduler.req_to_token_pool = SimpleNamespace(mamba_allocator=None)
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
+        scheduler.enable_hicache_storage = False
+        scheduler.enable_lmcache = False
+        scheduler.enable_hierarchical_cache = False
+        scheduler.enable_unified_cache_external_linker = False
+        scheduler.prefill_lookahead_bypass_total = 0
+        scheduler.prefill_lookahead_max_wait_seconds = 0.0
+        scheduler.truncation_align_size = None
+        scheduler.model_config = MagicMock()
+        scheduler.enable_overlap = False
+        scheduler.spec_algorithm = MagicMock()
+        scheduler.load_inquirer = MagicMock()
+        scheduler.load_inquirer._get_num_pending_tokens.return_value = 0
+        if running_batch is None:
+            running_batch = self.create_running_batch()
+        running_batch.batch_is_full = False
+        running_batch.is_empty.return_value = len(running_batch.reqs) == 0
+        running_batch.batch_size.return_value = len(running_batch.reqs)
+        running_batch.return_logprob = False
+        return scheduler, running_batch
+
+    def run_lookahead_scheduler(
+        self, scheduler, running_batch, *, window, max_bypasses
+    ):
+        config = SimpleNamespace(
+            prefill_max_requests=None,
+            prefill_lookahead_window=window,
+            prefill_lookahead_max_bypasses=max_bypasses,
+        )
+        new_batch = MagicMock()
+        new_batch.return_logprob = False
+        new_batch.input_embeds = None
+        with (
+            patch("sglang.srt.managers.scheduler.get_schedule", return_value=config),
+            patch(
+                "sglang.srt.managers.scheduler.ScheduleBatch.init_new",
+                return_value=new_batch,
+            ) as init_new,
+            patch("sglang.srt.managers.scheduler.PrefillStats.from_adder"),
+            patch("sglang.srt.managers.scheduler.set_time_batch"),
+        ):
+            result, running_batch = scheduler._get_new_batch_prefill_raw(
+                prefill_delayer_single_pass=None,
+                running_batch=running_batch,
+            )
+        admitted = list(init_new.call_args.args[0]) if init_new.called else []
+        return result, running_batch, admitted
 
     def create_adder(self, running_batch, **kwargs):
         defaults = dict(
@@ -183,11 +309,6 @@ class TestPrefillAdder(CustomTestCase):
         req.swa_host_hit_length = 0
         req.last_node = MagicMock()
         req.full_untruncated_fill_ids = list(range(12))
-        req.set_extend_range = MagicMock(
-            side_effect=lambda start, end: setattr(
-                req, "extend_range", Range(start, end)
-            )
-        )
         return req
 
     def create_shortest_prefill_adder(self, *, chunk_tokens=4096):
@@ -223,7 +344,7 @@ class TestPrefillAdder(CustomTestCase):
             continuation, waiting, adder.rem_chunk_tokens, adder.page_size
         )
         self.assertIs(adder.add_chunked_req(continuation), continuation)
-        self.assertEqual(continuation.extend_range.length, 2560)
+        self.assertEqual(continuation.extend_len, 2560)
         for req in waiting:
             adder.add_one_req(req, has_chunked_req=True, truncation_align_size=None)
         self.assertEqual(adder.can_run_list, [continuation, *waiting])
@@ -241,28 +362,25 @@ class TestPrefillAdder(CustomTestCase):
         )
         self.assertEqual(adder.can_run_list, [])
         self.assertIsNone(adder.new_chunked_req)
-        req.set_extend_range.assert_not_called()
+        self.assertIsNone(req.extend_end)
         self.mock_tree_cache.init_load_back.assert_not_called()
 
     def test_shortest_prefill_rechecks_chunk_limit_after_host_miss(self):
         adder = self.create_shortest_prefill_adder(chunk_tokens=512)
         req = self.create_shared_req("host-miss")
         req.full_untruncated_fill_ids = list(range(1024))
-        req.prefix_indices = torch.empty(0, dtype=torch.int64)
+        req.prefix_len = 0
         req.host_hit_length = 768
         req.best_match_node = req.last_node
         req.needs_host_load_back.return_value = True
-        self.mock_tree_cache.init_load_back.return_value = (
-            torch.empty(0, dtype=torch.int64),
-            req.last_node,
-        )
+        self.mock_tree_cache.init_load_back.return_value = (0, req.last_node)
         self.assertEqual(
             adder.add_one_req(req, has_chunked_req=True, truncation_align_size=None),
             AddReqResult.OTHER,
         )
         self.mock_tree_cache.init_load_back.assert_called_once()
         self.assertEqual(adder.can_run_list, [])
-        req.set_extend_range.assert_not_called()
+        self.assertIsNone(req.extend_end)
 
     def test_shortest_prefill_preserves_memory_admission(self):
         adder = self.create_shortest_prefill_adder()
@@ -271,16 +389,66 @@ class TestPrefillAdder(CustomTestCase):
         req.full_untruncated_fill_ids = list(range(512))
         self.assertEqual(
             adder.add_one_req(req, has_chunked_req=True, truncation_align_size=None),
-            AddReqResult.NO_TOKEN,
+            AddReqResult.NO_TOKEN_FOR_REQUEST,
         )
         self.assertEqual(adder.can_run_list, [])
+
+    def test_hisparse_short_prompts_reserve_full_buffers_and_scratch(self):
+        """Short prompts and chunks must fit persistent buffers plus one scratch."""
+        for available, chunk, prefix, ignore_eos, admitted in (
+            (10496, None, 0, False, 2),
+            (10496, None, 0, True, 2),
+            (5248, 64, 0, False, 1),
+            (4096, 64, 64, False, 0),
+            (4160, 64, 64, False, 1),
+        ):
+            with self.subTest(available=available, chunk=chunk, prefix=prefix):
+                self.mock_tree_cache.supports_mamba.return_value = False
+                self.mock_tree_cache.disable = ignore_eos
+                allocator = HiSparseTokenToKVPoolAllocator(
+                    size=available,
+                    page_size=64,
+                    dtype=torch.float32,
+                    device="cpu",
+                    kvcache=SimpleNamespace(register_mapping=lambda mapping: None),
+                    need_sort=False,
+                )
+                allocator.configure_spec_scratch(1024, device_buffer_size=4160)
+                adder = self.create_adder(
+                    self.create_running_batch(),
+                    page_size=64,
+                    rem_chunk_tokens=chunk,
+                    token_to_kv_pool_allocator=allocator,
+                )
+                reqs = []
+                for i in range(3):
+                    req = self.create_shared_req(f"hisparse-{i}", max_new_tokens=0)
+                    req.sampling_params.ignore_eos = ignore_eos
+                    req.full_untruncated_fill_ids = list(range(100))
+                    req.origin_input_ids = req.full_untruncated_fill_ids
+                    req.prefix_len = prefix
+                    req.kv = SimpleNamespace(req_pool_idx=i if prefix else None)
+                    reqs.append(req)
+                    if prefix:
+                        adder.add_chunked_req(req)
+                    else:
+                        adder.add_one_req(
+                            req, has_chunked_req=False, truncation_align_size=None
+                        )
+                self.assertEqual(adder.can_run_list, reqs[:admitted])
+                if admitted:
+                    self.assertEqual(adder.cur_rem_tokens, 0)
+                    self.assertEqual(
+                        reqs[0].extend_len,
+                        64 if chunk and not prefix else 100 - prefix,
+                    )
 
     def test_continuation_without_limit_keeps_normal_chunk_size(self):
         adder = self.create_shortest_prefill_adder()
         req = self.create_shared_req("continuation")
         req.full_untruncated_fill_ids = list(range(8192))
         self.assertIs(adder.add_chunked_req(req), req)
-        self.assertEqual(req.extend_range.length, 4096)
+        self.assertEqual(req.extend_len, 4096)
 
     def test_exact_chunk_fill_keeps_mamba_chunks_page_aligned(self):
         # A Mamba checkpoint only lands on a page-aligned chunk end, so an
@@ -310,7 +478,7 @@ class TestPrefillAdder(CustomTestCase):
                 adder.add_one_req(
                     req, has_chunked_req=False, truncation_align_size=None
                 )
-                self.assertEqual(req.extend_range.length, expected)
+                self.assertEqual(req.extend_len, expected)
 
     def test_shared_admission_reserves_all_pending_requests(self):
         adder = self.create_shared_adder()
@@ -324,7 +492,7 @@ class TestPrefillAdder(CustomTestCase):
             adder.add_one_req(
                 second, has_chunked_req=False, truncation_align_size=None
             ),
-            AddReqResult.NO_TOKEN,
+            AddReqResult.NO_TOKEN_FOR_REQUEST,
         )
         self.assertEqual(adder.can_run_list, [first])
 
@@ -343,7 +511,7 @@ class TestPrefillAdder(CustomTestCase):
         req = self.create_shared_req("locked-prefix")
         self.assertEqual(
             adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None),
-            AddReqResult.NO_TOKEN,
+            AddReqResult.NO_TOKEN_FOR_REQUEST,
         )
         self.mock_tree_cache.inc_lock_ref.assert_called_once()
         self.assertEqual(adder.can_run_list, [])
@@ -360,7 +528,7 @@ class TestPrefillAdder(CustomTestCase):
                 )
                 self.assertIs(adder.add_chunked_req(req), req)
                 self.assertEqual(adder.can_run_list, [])
-                req.set_extend_range.assert_not_called()
+                self.assertIsNone(req.extend_end)
                 self.assertEqual(
                     (adder.memory_budget.total_offset, adder.memory_budget.swa_offset),
                     before,
@@ -370,7 +538,7 @@ class TestPrefillAdder(CustomTestCase):
         adder = self.create_shared_adder()
         req = self.create_shared_req("continuation", max_new_tokens=80)
         self.assertIs(adder.add_chunked_req(req), req)
-        self.assertEqual(req.extend_range.length, 8)
+        self.assertEqual(req.extend_len, 8)
         self.assertEqual(adder.memory_budget.total_offset, 12)
         self.assertEqual(adder.memory_budget.swa_offset, 12)
 
@@ -708,19 +876,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder.budget_state(), AddReqResult.CONTINUE)
 
         # Add a prefill that exactly consumes the chunk budget
-        req1 = self.create_mock_req("req1", priority=0, max_new_tokens=64)
-        req1.host_hit_length = 0
-        req1.prefix_indices = []
-        req1.full_untruncated_fill_ids = list(range(56))
-        req1.last_node = MagicMock()
-        req1.sampling_params.ignore_eos = False
-        # add_one_req reads req.extend_range.length after set_extend_range;
-        # emulate the real Req writer (a spec=Req mock lacks the attribute).
-        req1.set_extend_range = MagicMock(
-            side_effect=lambda start, end: setattr(
-                req1, "extend_range", Range(start, end)
-            )
-        )
+        req1 = self._create_delayer_req(56, rid="req1", max_new_tokens=64)
 
         result1 = adder.add_one_req(
             req1, has_chunked_req=False, truncation_align_size=None
@@ -748,17 +904,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder2.budget_state(), AddReqResult.CONTINUE)
 
         # Same prefill no longer exhausts the chunk budget
-        req2 = self.create_mock_req("req2", priority=0, max_new_tokens=64)
-        req2.host_hit_length = 0
-        req2.prefix_indices = []
-        req2.full_untruncated_fill_ids = list(range(56))
-        req2.last_node = MagicMock()
-        req2.sampling_params.ignore_eos = False
-        req2.set_extend_range = MagicMock(
-            side_effect=lambda start, end: setattr(
-                req2, "extend_range", Range(start, end)
-            )
-        )
+        req2 = self._create_delayer_req(56, rid="req2", max_new_tokens=64)
 
         result2 = adder2.add_one_req(
             req2, has_chunked_req=False, truncation_align_size=None
@@ -769,17 +915,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(result2, AddReqResult.CONTINUE)
 
         # Fit last small prefill request
-        req3 = self.create_mock_req("req3", priority=0, max_new_tokens=16)
-        req3.host_hit_length = 0
-        req3.prefix_indices = []
-        req3.full_untruncated_fill_ids = list(range(3))
-        req3.last_node = MagicMock()
-        req3.sampling_params.ignore_eos = False
-        req3.set_extend_range = MagicMock(
-            side_effect=lambda start, end: setattr(
-                req3, "extend_range", Range(start, end)
-            )
-        )
+        req3 = self._create_delayer_req(3, rid="req3", max_new_tokens=16)
 
         result3 = adder2.add_one_req(
             req3, has_chunked_req=False, truncation_align_size=None
@@ -808,19 +944,14 @@ class TestPrefillAdder(CustomTestCase):
         req.origin_input_ids = list(range(16))
         req.full_untruncated_fill_ids = list(range(16))
         req.last_node = MagicMock()
-        req.set_extend_range = MagicMock(
-            side_effect=lambda start, end: setattr(
-                req, "extend_range", Range(start, end)
-            )
-        )
 
         result = adder.add_one_req(
             req, has_chunked_req=False, truncation_align_size=None
         )
 
-        self.assertEqual(result, AddReqResult.NO_TOKEN)
+        self.assertEqual(result, AddReqResult.NO_TOKEN_FOR_REQUEST)
         self.assertEqual(adder.can_run_list, [])
-        req.set_extend_range.assert_not_called()
+        self.assertIsNone(req.extend_end)
 
     def create_sharded_adder(
         self,
@@ -861,7 +992,7 @@ class TestPrefillAdder(CustomTestCase):
 
     def create_sharded_req(self, rid, *, prefix_len=12, extend_len=4):
         req = self.create_shared_req(rid, max_new_tokens=1)
-        req.prefix_indices = list(range(prefix_len))
+        req.prefix_len = prefix_len
         req.full_untruncated_fill_ids = list(range(prefix_len + extend_len))
         return req
 
@@ -883,7 +1014,7 @@ class TestPrefillAdder(CustomTestCase):
             AddReqResult.OTHER,
         )
         self.assertEqual(adder.can_run_list, [first])
-        second.set_extend_range.assert_not_called()
+        self.assertIsNone(second.extend_end)
         self.assertEqual((adder.rem_total_tokens, adder.rem_chunk_tokens), remaining)
         self.assertEqual(adder.kv_shard_block_bound_pages, 2)
         self.assertEqual(adder.kv_shard_chunk_pages, 1)
@@ -962,7 +1093,7 @@ class TestPrefillAdder(CustomTestCase):
                     AddReqResult.OTHER,
                 )
                 self.assertEqual(adder.can_run_list, reqs[:8])
-                reqs[8].set_extend_range.assert_not_called()
+                self.assertIsNone(reqs[8].extend_end)
                 self.assertEqual(
                     (
                         adder.rem_total_tokens,
@@ -1007,7 +1138,7 @@ class TestPrefillAdder(CustomTestCase):
                 )
                 self.assertEqual(adder.can_run_list, [req])
                 self.assertIs(adder.new_chunked_req, req)
-                self.assertEqual(req.extend_range, Range(12, 12 + selected))
+                self.assertEqual((req.prefix_len, req.extend_end), (12, 12 + selected))
                 self.assertEqual(adder.kv_shard_block_bound_pages, 2)
                 self.assertEqual(adder.kv_shard_chunk_pages, selected // 4)
 
@@ -1021,7 +1152,7 @@ class TestPrefillAdder(CustomTestCase):
             AddReqResult.OTHER,
         )
         self.assertEqual(adder.can_run_list, [])
-        req.set_extend_range.assert_not_called()
+        self.assertIsNone(req.extend_end)
         self.assertEqual(adder.kv_shard_block_bound_pages, 0)
         self.assertEqual(adder.kv_shard_chunk_pages, 0)
 
@@ -1060,17 +1191,8 @@ class TestPrefillAdder(CustomTestCase):
             )
 
         req = self.create_mock_req("chunked", priority=0, max_new_tokens=128)
-        req.prefix_indices = []
+        req.prefix_len = 0
         req.full_untruncated_fill_ids = list(range(extend_input_len))
-        # set_extend_range is the only writer of extend_range; the production
-        # path reads req.extend_range.length right after calling it, so the mock
-        # must actually set the attribute (a spec=Req mock has the method but
-        # not the instance attribute).
-        req.set_extend_range = MagicMock(
-            side_effect=lambda start, end: setattr(
-                req, "extend_range", Range(start, end)
-            )
-        )
         return adder, req
 
     def test_add_chunked_req_hybrid_swa_reserves_page_for_alloc_extend(self):
@@ -1087,8 +1209,7 @@ class TestPrefillAdder(CustomTestCase):
         result = adder.add_chunked_req(req)
 
         self.assertIs(result, req)  # truncated → chunked prefill continues
-        req.set_extend_range.assert_called_once()
-        start, end = req.set_extend_range.call_args.args
+        start, end = req.prefix_len, req.extend_end
         new_len = end - start
         self.assertLessEqual(new_len + PAGE_SIZE, REM_SWA)
         self.assertEqual(new_len, REM_SWA - PAGE_SIZE)
@@ -1105,7 +1226,7 @@ class TestPrefillAdder(CustomTestCase):
         result = adder.add_chunked_req(req)
 
         self.assertIs(result, req)
-        req.set_extend_range.assert_not_called()
+        self.assertIsNone(req.extend_end)
         self.assertEqual(len(adder.can_run_list), 0)
 
     def test_swa_budget_for_req(self):
@@ -1172,16 +1293,11 @@ class TestPrefillAdder(CustomTestCase):
         req = self.create_mock_req(
             "resume", priority=0, max_new_tokens=40, output_len=10
         )
-        req.prefix_indices = list(range(PREFIX))
+        req.prefix_len = PREFIX
         req.full_untruncated_fill_ids = list(range(PREFIX + EXTEND))
         req.host_hit_length = 0
         req.swa_host_hit_length = 0
         req.last_node = MagicMock()
-        req.set_extend_range = MagicMock(
-            side_effect=lambda start, end: setattr(
-                req, "extend_range", Range(start, end)
-            )
-        )
         req.sampling_params = SimpleNamespace(max_new_tokens=40, ignore_eos=False)
 
         # Pre-fix: a constant sliding-window reservation rejects the resume.
@@ -1192,7 +1308,7 @@ class TestPrefillAdder(CustomTestCase):
                 adder.add_one_req(
                     req, has_chunked_req=False, truncation_align_size=None
                 ),
-                AddReqResult.NO_TOKEN,
+                AddReqResult.NO_TOKEN_FOR_REQUEST,
             )
         self.assertEqual(len(adder.can_run_list), 0)
 
@@ -1222,19 +1338,15 @@ class TestPrefillAdder(CustomTestCase):
                 self.mock_token_allocator, self.mock_tree_cache
             )
             req = self.create_mock_req("dropped-fetch", priority=0, max_new_tokens=8)
-            req.prefix_indices = torch.empty(0, dtype=torch.int64)
+            req.prefix_len = 0
             req.full_untruncated_fill_ids = list(range(SPAN))
             req.host_hit_length = HOST_HIT
             req.swa_host_hit_length = WINDOW
             req.needs_host_load_back.return_value = True
             req.last_node = MagicMock()
             req.best_match_node = MagicMock()
-            req.kv = SimpleNamespace(cache_protected_len=0)
+            req.kv.cache_protected_len = 0
 
-            def set_extend_range(start, end):
-                req.extend_range = Range(start, end)
-
-            req.set_extend_range = MagicMock(side_effect=set_extend_range)
             req.sampling_params = SimpleNamespace(max_new_tokens=8, ignore_eos=False)
 
             def load_back(params):
@@ -1243,7 +1355,7 @@ class TestPrefillAdder(CustomTestCase):
                 )
                 if remaining_after_load == 0:
                     self.mock_token_allocator.swa_available_size.return_value = 0
-                return torch.arange(delivered, dtype=torch.int64), req.last_node
+                return delivered, req.last_node
 
             self.mock_tree_cache.init_load_back.side_effect = load_back
             verdict = adder.add_one_req(
@@ -1264,21 +1376,270 @@ class TestPrefillAdder(CustomTestCase):
         # budget. A successful load must not run admission gates again.
         _, admitted, req = run(HOST_HIT + 4, remaining_after_load=0)
         self.assertEqual(len(admitted), 1)
-        self.assertEqual(len(req.prefix_indices), HOST_HIT + 4)
+        self.assertEqual(req.prefix_len, HOST_HIT + 4)
         self.assertEqual(req.kv.cache_protected_len, HOST_HIT + 4)
-        req.set_extend_range.assert_called_once_with(HOST_HIT + 4, SPAN)
+        self.assertEqual((req.prefix_len, req.extend_end), (HOST_HIT + 4, SPAN))
         # A partial FULL load stays fatal.
         with self.assertRaisesRegex(RuntimeError, "promised"):
             run(HOST_HIT // 2)
 
+    def _build_hicache_restore_admission(
+        self,
+        *,
+        restored_tokens=0,
+        restored_swa_tokens=0,
+        available_swa=4096,
+        chunk_tokens=16384,
+        size_swa=16384,
+        ring=False,
+    ):
+        self.mock_token_allocator = self.create_token_allocator(
+            full_available_size=100_000,
+            swa_available_size=available_swa,
+            size_swa=size_swa,
+        )
+        self.mock_token_allocator.mock_add_spec(SWATokenToKVPoolAllocator)
+        self.mock_token_allocator.swa_req_ring = ring
+        self.mock_token_allocator.swa_ring_cost_tokens = 4096
+        self.mock_token_allocator.create_prefill_budget.side_effect = (
+            lambda tree_cache, **kwargs: SWAPrefillBudget(
+                self.mock_token_allocator, tree_cache, **kwargs
+            )
+        )
+        self.mock_tree_cache = self.create_tree_cache()
+        self.mock_tree_cache.sliding_window_size = 1024
+        self.mock_tree_cache.supports_mamba.return_value = False
+        adder = self.create_adder(
+            self.create_running_batch(), page_size=128, rem_chunk_tokens=chunk_tokens
+        )
+        req = self._create_host_hit_req(host_hit=6144, tail=2048)
+        req.sampling_params.max_new_tokens = 1024
+        req.swa_host_hit_length = 1024
+        req.best_match_node = MagicMock()
+        req.needs_host_load_back.return_value = True
+
+        def load_back(params):
+            self.assertIs(params.req, req)
+            self.mock_token_allocator.swa_available_size.return_value -= (
+                restored_swa_tokens
+            )
+            return restored_tokens, req.last_node
+
+        self.mock_tree_cache.init_load_back.side_effect = load_back
+        return adder, req
+
+    def test_swa_failed_host_restore_defers_before_committing_request(self):
+        for chunk_tokens, has_prior_req in (
+            (None, False),
+            (4096, False),
+            (16384, False),
+            (16384, True),
+        ):
+            with self.subTest(chunk_tokens=chunk_tokens, has_prior_req=has_prior_req):
+                adder, req = self._build_hicache_restore_admission(
+                    chunk_tokens=chunk_tokens
+                )
+                if has_prior_req:
+                    first = self._create_delayer_req(
+                        512, rid="first", max_new_tokens=16
+                    )
+                    first.swa_host_hit_length = 0
+                    adder.add_one_req(
+                        first, has_chunked_req=False, truncation_align_size=None
+                    )
+                admitted_before = [first] if has_prior_req else []
+                budget_before = (
+                    adder.memory_budget.remaining_swa,
+                    adder.rem_total_tokens,
+                    adder.rem_chunk_tokens,
+                )
+                original_node = req.last_node = 42
+                original_receipt = req.lock_receipt = DecLockRefParams(node_id=7)
+                acquired = IncLockRefResult(
+                    node_id=42, skipped_lock_components=(ComponentType.SWA,)
+                )
+                self.mock_tree_cache.inc_lock_ref.return_value = acquired
+                self.mock_tree_cache.reset_mock()
+
+                result = adder.add_one_req(
+                    req, has_chunked_req=False, truncation_align_size=None
+                )
+
+                self.assertIs(result, AddReqResult.NO_TOKEN)
+                self.assertEqual(adder.can_run_list, admitted_before)
+                self.assertIsNone(adder.new_chunked_req)
+                self.assertIsNone(req.extend_end)
+                self.assertEqual(
+                    (
+                        adder.memory_budget.remaining_swa,
+                        adder.rem_total_tokens,
+                        adder.rem_chunk_tokens,
+                    ),
+                    budget_before,
+                )
+                self.assertIs(req.lock_receipt, original_receipt)
+                self.mock_tree_cache.init_load_back.assert_called_once()
+                self.mock_tree_cache.inc_lock_ref.assert_called_once_with(original_node)
+                self.mock_tree_cache.dec_lock_ref.assert_called_once_with(
+                    original_node, acquired.to_dec_params()
+                )
+
+    def test_swa_failed_host_restore_retries_when_capacity_recovers(self):
+        adder, req = self._build_hicache_restore_admission()
+        self.assertIs(
+            adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None),
+            AddReqResult.NO_TOKEN,
+        )
+        self.assertEqual(adder.can_run_list, [])
+
+        self.mock_token_allocator.swa_available_size.return_value = 10_240
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertIs(result, AddReqResult.CONTINUE)
+        self.assertEqual(adder.can_run_list, [req])
+        self.assertEqual((req.prefix_len, req.extend_end), (0, 8192))
+        self.assertGreaterEqual(adder.memory_budget.remaining_swa, 0)
+        self.assertEqual(self.mock_tree_cache.inc_lock_ref.call_count, 3)
+        self.assertEqual(self.mock_tree_cache.dec_lock_ref.call_count, 2)
+
+    def test_swa_host_restore_admitted(self):
+        for label, options, expected_range, remaining_swa, expected_result in (
+            (
+                "restored",
+                dict(
+                    restored_tokens=6144, restored_swa_tokens=1024, available_swa=3328
+                ),
+                (6144, 8192),
+                128,
+                AddReqResult.CONTINUE,
+            ),
+            (
+                "exact_fit_ring",
+                dict(ring=True),
+                (0, 8192),
+                0,
+                AddReqResult.NO_TOKEN,
+            ),
+            (
+                "fitting_chunk",
+                dict(chunk_tokens=2048),
+                (0, 2048),
+                1920,
+                AddReqResult.OTHER,
+            ),
+            (
+                "never_fits",
+                dict(size_swa=4096),
+                (0, 2944),
+                1024,
+                AddReqResult.CONTINUE,
+            ),
+        ):
+            with self.subTest(label=label):
+                adder, req = self._build_hicache_restore_admission(**options)
+
+                result = adder.add_one_req(
+                    req, has_chunked_req=False, truncation_align_size=None
+                )
+
+                self.assertIs(result, expected_result)
+                self.mock_tree_cache.init_load_back.assert_called_once()
+                self.assertEqual(adder.can_run_list, [req])
+                expected_start, expected_end = expected_range
+                self.assertEqual((req.prefix_len, req.extend_end), expected_range)
+                self.assertEqual(req.host_loaded_length, expected_start)
+                self.assertIs(
+                    adder.new_chunked_req, req if expected_end < 8192 else None
+                )
+                self.assertEqual(adder.memory_budget.remaining_swa, remaining_swa)
+
+    def test_swa_partial_host_restore_fails_loudly_before_request_commit(self):
+        adder, req = self._build_hicache_restore_admission(
+            restored_tokens=3072, restored_swa_tokens=1024
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "HiCache load-back"):
+            adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+
+        self.assertEqual(adder.can_run_list, [])
+        self.assertIsNone(req.extend_end)
+
     def _create_host_hit_req(self, *, prefix_len=0, host_hit=8192, tail=1024):
         req = self._create_delayer_req(prefix_len + host_hit + tail)
-        req.prefix_indices = torch.arange(prefix_len)
+        req.prefix_len = prefix_len
         req.host_hit_length = host_hit
         req.needs_host_load_back.return_value = True
         req.best_match_node = req.last_node
-        req.kv = SimpleNamespace(cache_protected_len=prefix_len)
+        req.kv.cache_protected_len = prefix_len
         return req
+
+    def _build_mamba_restore_admission(self, *, holds_state, available_slots):
+        self.mock_token_allocator = self.create_token_allocator(available_size=100_000)
+        self.mock_tree_cache = self.create_tree_cache()
+        self.mock_tree_cache.mock_add_spec(schedule_policy.UnifiedRadixCache)
+        self.mock_tree_cache.buffer_pipeline = MagicMock()
+        adder = self.create_adder(self.create_running_batch())
+        adder._mamba_slot_cost = 64
+        adder.rem_mamba_slots = available_slots
+        req = self._create_host_hit_req(host_hit=32, tail=8)
+        req.mamba_host_hit_length = 1
+        req.kv.holds_mamba = holds_state
+
+        def load_back(params):
+            req.kv.holds_mamba = True
+            return req.host_hit_length, req.last_node
+
+        self.mock_tree_cache.init_load_back.side_effect = load_back
+        return adder, req
+
+    def test_mamba_restore_admission_counts_request_and_checkpoint(self):
+        for holds_state, slots, capacity, admitted in (
+            (False, 1, 100_000, False),
+            (True, 0, 100_000, False),
+            (False, 2, 100_000, True),
+            (True, 1, 100_000, True),
+            (False, 2, 150, False),  # Enough shared bytes for one state, not two.
+        ):
+            with self.subTest(holds_state=holds_state, slots=slots, capacity=capacity):
+                adder, req = self._build_mamba_restore_admission(
+                    holds_state=holds_state, available_slots=slots
+                )
+                self.mock_token_allocator.available_size.return_value = capacity
+                result = adder.add_one_req(req, False, None)
+                self.assertEqual(adder.can_run_list, [req] if admitted else [])
+                self.assertEqual(adder.rem_mamba_slots, 0 if admitted else slots)
+                if admitted:
+                    self.mock_tree_cache.init_load_back.assert_called_once()
+                    self.assertEqual(
+                        adder.memory_budget.total_offset, 8 + 8 + 1 + slots * 64
+                    )
+                else:
+                    self.assertIs(result, AddReqResult.NO_TOKEN)
+                    self.mock_tree_cache.init_load_back.assert_not_called()
+                    self.assertEqual(adder.memory_budget.total_offset, 0)
+                    if capacity == 100_000:
+                        self.mock_tree_cache.buffer_pipeline.defer_staged_admission.assert_called_once_with(
+                            req, "mamba"
+                        )
+
+    def test_mamba_chunk_continuation_does_not_charge_restored_state_again(self):
+        adder, req = self._build_mamba_restore_admission(
+            holds_state=False, available_slots=2
+        )
+        adder.rem_chunk_tokens = 4
+        adder.add_one_req(req, False, None)
+        self.assertIs(adder.new_chunked_req, req)
+        req.prefix_len = req.extend_end
+        # Continuing chunks retain the original host-hit metadata.
+        self.assertEqual(req.mamba_host_hit_length, 1)
+        next_adder = self.create_adder(self.create_running_batch(), rem_chunk_tokens=4)
+        next_adder._mamba_slot_cost = 64
+        next_adder.rem_mamba_slots = 0
+        self.assertIsNone(next_adder.add_chunked_req(req))
+        self.assertEqual(next_adder.rem_mamba_slots, 0)
+        self.assertEqual(next_adder.memory_budget.total_offset, 4 + 8 + 1)
 
     def test_successful_load_back_commits_the_selected_shape_once(self):
         cases = (
@@ -1343,7 +1704,7 @@ class TestPrefillAdder(CustomTestCase):
                     self.assertIs(params.req, req)
                     tile_gate.assert_called_once()
                     tile_gate.return_value = AddReqResult.OTHER
-                    return torch.arange(host_hit), restored_node
+                    return host_hit, restored_node
 
                 self.mock_tree_cache.init_load_back.side_effect = load_back
                 with patch.object(
@@ -1353,7 +1714,7 @@ class TestPrefillAdder(CustomTestCase):
                     tile_gate.assert_called_once()
                 self.mock_tree_cache.init_load_back.assert_called_once()
                 self.assertEqual(adder.can_run_list, [req])
-                req.set_extend_range.assert_called_once_with(24, 24 + extend)
+                self.assertEqual((req.prefix_len, req.extend_end), (24, 24 + extend))
                 self.mock_tree_cache.inc_lock_ref.assert_any_call(restored_node)
                 self.assertIs(
                     self.mock_tree_cache.dec_lock_ref.call_args.args[0], old_node
@@ -1399,11 +1760,479 @@ class TestPrefillAdder(CustomTestCase):
                 )
                 self.assertEqual(adder._swa_new_tokens(req), expected)
 
+    def test_lookahead_bypasses_oversized_ignore_eos_request(self):
+        """The disabled-radix ignore_eos path must classify its initial,
+        side-effect-free KV rejection as request-local so a smaller request
+        later in the waiting queue can still be admitted."""
+        self.mock_tree_cache.disable = True
+        self.mock_token_allocator.available_size.return_value = 100
+        adder = self.create_adder(self.create_running_batch())
+        lookahead = PrefillLookahead(window=8)
+
+        def make_req(rid: str, input_len: int):
+            req = self.create_mock_req(rid, priority=0, max_new_tokens=1)
+            req.sampling_params.ignore_eos = True
+            req.origin_input_ids = list(range(input_len))
+            req.full_untruncated_fill_ids = list(range(input_len))
+            return req
+
+        oversized = make_req("oversized", 200)
+        fitting = make_req("fitting", 10)
+        results = []
+
+        for queue_index, req in enumerate([oversized, fitting]):
+            result = adder.add_one_req(
+                req,
+                has_chunked_req=False,
+                truncation_align_size=None,
+            )
+            results.append(result)
+            added = bool(adder.can_run_list) and req is adder.can_run_list[-1]
+            if result != AddReqResult.CONTINUE:
+                if lookahead.can_bypass(result, added) and lookahead.start(queue_index):
+                    continue
+                break
+
+        self.assertEqual(results[0], AddReqResult.NO_TOKEN_FOR_REQUEST)
+        self.assertEqual(results[1], AddReqResult.CONTINUE)
+        self.assertEqual(adder.can_run_list, [fitting])
+        self.assertEqual(adder.req_states, [(1.0, 10)])
+
+    def test_lookahead_does_not_bypass_ignore_eos_after_state_mutation(self):
+        """A later ignore_eos rejection has already inserted req_states and
+        must remain a batch-level NO_TOKEN result until rollback exists."""
+        self.mock_tree_cache.disable = True
+        self.mock_token_allocator.available_size.return_value = 100
+        adder = self.create_adder(self.create_running_batch())
+        req = self.create_mock_req("decode-heavy", priority=0, max_new_tokens=200)
+        req.sampling_params.ignore_eos = True
+        req.origin_input_ids = list(range(10))
+        req.full_untruncated_fill_ids = list(range(10))
+
+        result = adder.add_one_req(
+            req,
+            has_chunked_req=False,
+            truncation_align_size=None,
+        )
+
+        self.assertEqual(result, AddReqResult.NO_TOKEN)
+        self.assertEqual(adder.req_states, [(200.0, 10)])
+        self.assertFalse(PrefillLookahead.can_bypass(result, added=False))
+
+    def test_global_kv_exhaustion_is_not_request_local(self):
+        self.mock_tree_cache.disable = True
+        self.mock_token_allocator.available_size.return_value = 0
+        adder = self.create_adder(self.create_running_batch())
+        req = self.create_lookahead_req("blocked", input_len=10)
+
+        result = adder.add_one_req(
+            req,
+            has_chunked_req=False,
+            truncation_align_size=None,
+        )
+
+        self.assertEqual(result, AddReqResult.NO_TOKEN)
+
+    def test_default_radix_path_reports_global_kv_exhaustion(self):
+        self.mock_tree_cache.disable = False
+        self.mock_token_allocator.available_size.return_value = 0
+        self.mock_token_allocator.full_available_size.return_value = 0
+        adder = self.create_adder(self.create_running_batch())
+        req = self._create_delayer_req(10)
+
+        result = adder.add_one_req(
+            req,
+            has_chunked_req=False,
+            truncation_align_size=None,
+        )
+
+        self.assertEqual(result, AddReqResult.NO_TOKEN)
+
+    def test_scheduler_loop_preserves_strict_mode_and_backfills_when_enabled(self):
+        for window, expected_admitted in ((0, []), (1, ["small"])):
+            with self.subTest(window=window):
+                big = self.create_lookahead_req("big", input_len=200)
+                small = self.create_lookahead_req("small", input_len=10)
+                scheduler, running = self.create_lookahead_scheduler([big, small])
+
+                _, running, admitted = self.run_lookahead_scheduler(
+                    scheduler,
+                    running,
+                    window=window,
+                    max_bypasses=8,
+                )
+
+                self.assertEqual([req.rid for req in admitted], expected_admitted)
+                if window == 0:
+                    self.assertEqual(scheduler.waiting_queue, [big, small])
+                    self.assertTrue(running.batch_is_full)
+                    small.init_next_round_input.assert_not_called()
+                else:
+                    self.assertEqual(scheduler.waiting_queue, [big])
+                    self.assertEqual(big.prefill_lookahead_bypass_count, 1)
+
+    def test_scheduler_loop_counts_only_actual_bypasses(self):
+        big = self.create_lookahead_req("big", input_len=200)
+        scheduler, running = self.create_lookahead_scheduler([big])
+
+        _, running, admitted = self.run_lookahead_scheduler(
+            scheduler,
+            running,
+            window=8,
+            max_bypasses=8,
+        )
+
+        self.assertEqual(admitted, [])
+        self.assertEqual(big.prefill_lookahead_bypass_count, 0)
+        self.assertEqual(scheduler.prefill_lookahead_bypass_total, 0)
+
+    def test_scheduler_loop_counts_once_when_multiple_requests_overtake(self):
+        big = self.create_lookahead_req("big", input_len=200)
+        small0 = self.create_lookahead_req("small-0", input_len=10)
+        small1 = self.create_lookahead_req("small-1", input_len=10)
+        scheduler, running = self.create_lookahead_scheduler(
+            [big, small0, small1]
+        )
+
+        _, _, admitted = self.run_lookahead_scheduler(
+            scheduler,
+            running,
+            window=8,
+            max_bypasses=8,
+        )
+
+        self.assertEqual(admitted, [small0, small1])
+        self.assertEqual(scheduler.waiting_queue, [big])
+        self.assertEqual(big.prefill_lookahead_bypass_count, 1)
+        self.assertEqual(scheduler.prefill_lookahead_bypass_total, 1)
+
+    def test_lookahead_wait_metric_resets_after_periodic_log(self):
+        blocked = self.create_lookahead_req("blocked", input_len=200)
+        blocked.time_stats.wait_queue_entry_time = 90.0
+        scheduler, _ = self.create_lookahead_scheduler([blocked])
+        scheduler.prefill_lookahead_bypass_total = 127
+        scheduler.prefill_lookahead_max_wait_seconds = 3.0
+
+        with (
+            get_parallel().override(
+                pp_rank=0,
+                attn_tp_rank=0,
+                attn_cp_rank=0,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler.time.monotonic",
+                return_value=100.0,
+            ),
+        ):
+            scheduler._record_prefill_lookahead_bypasses([blocked])
+
+        self.assertEqual(blocked.prefill_lookahead_bypass_count, 1)
+        self.assertEqual(scheduler.prefill_lookahead_bypass_total, 128)
+        self.assertEqual(scheduler.prefill_lookahead_max_wait_seconds, 0.0)
+
+    def test_lookahead_wait_metric_does_not_log_on_nonzero_rank(self):
+        blocked = self.create_lookahead_req("blocked", input_len=200)
+        blocked.time_stats.wait_queue_entry_time = 90.0
+        scheduler, _ = self.create_lookahead_scheduler([blocked])
+        scheduler.prefill_lookahead_bypass_total = 127
+        scheduler.prefill_lookahead_max_wait_seconds = 3.0
+
+        with (
+            get_parallel().override(
+                pp_rank=0,
+                attn_tp_rank=1,
+                attn_tp_size=2,
+                tp_size=2,
+                moe_tp_size=2,
+                attn_cp_rank=0,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler.time.monotonic",
+                return_value=100.0,
+            ),
+            patch("sglang.srt.managers.scheduler.logger.info") as log_info,
+        ):
+            scheduler._record_prefill_lookahead_bypasses([blocked])
+
+        log_info.assert_not_called()
+        self.assertEqual(blocked.prefill_lookahead_bypass_count, 1)
+        self.assertEqual(scheduler.prefill_lookahead_bypass_total, 128)
+        self.assertEqual(scheduler.prefill_lookahead_max_wait_seconds, 0.0)
+
+    def test_scheduler_loop_stops_at_window_boundary(self):
+        big0 = self.create_lookahead_req("big-0", input_len=200)
+        big1 = self.create_lookahead_req("big-1", input_len=200)
+        small = self.create_lookahead_req("small", input_len=10)
+        scheduler, running = self.create_lookahead_scheduler([big0, big1, small])
+
+        _, running, admitted = self.run_lookahead_scheduler(
+            scheduler,
+            running,
+            window=1,
+            max_bypasses=8,
+        )
+
+        self.assertEqual(admitted, [])
+        self.assertEqual(scheduler.waiting_queue, [big0, big1, small])
+        self.assertEqual(big0.prefill_lookahead_bypass_count, 0)
+        self.assertEqual(big1.prefill_lookahead_bypass_count, 0)
+        self.assertTrue(running.batch_is_full)
+        small.init_next_round_input.assert_not_called()
+
+    def test_scheduler_loop_backfill_at_window_boundary_keeps_batch_open(self):
+        big0 = self.create_lookahead_req("big-0", input_len=200)
+        small = self.create_lookahead_req("small", input_len=10)
+        big1 = self.create_lookahead_req("big-1", input_len=200)
+        scheduler, running = self.create_lookahead_scheduler([big0, small, big1])
+
+        _, running, admitted = self.run_lookahead_scheduler(
+            scheduler,
+            running,
+            window=1,
+            max_bypasses=8,
+        )
+
+        self.assertEqual(admitted, [small])
+        self.assertEqual(scheduler.waiting_queue, [big0, big1])
+        self.assertFalse(running.batch_is_full)
+        big1.init_next_round_input.assert_not_called()
+
+    def test_scheduler_loop_stops_after_max_bypasses(self):
+        big = self.create_lookahead_req("big", input_len=200)
+        scheduler, running = self.create_lookahead_scheduler([big])
+
+        for round_index in range(2):
+            small = self.create_lookahead_req(f"small-{round_index}", input_len=10)
+            scheduler.waiting_queue.append(small)
+            _, running, admitted = self.run_lookahead_scheduler(
+                scheduler,
+                running,
+                window=1,
+                max_bypasses=2,
+            )
+            self.assertEqual(admitted, [small])
+            self.assertEqual(scheduler.waiting_queue, [big])
+
+        blocked_small = self.create_lookahead_req("small-blocked", input_len=10)
+        scheduler.waiting_queue.append(blocked_small)
+        _, running, admitted = self.run_lookahead_scheduler(
+            scheduler,
+            running,
+            window=1,
+            max_bypasses=2,
+        )
+
+        self.assertEqual(admitted, [])
+        self.assertEqual(scheduler.waiting_queue, [big, blocked_small])
+        self.assertEqual(big.prefill_lookahead_bypass_count, 2)
+        self.assertTrue(running.batch_is_full)
+        blocked_small.init_next_round_input.assert_not_called()
+
+        self.mock_token_allocator.available_size.return_value = 1000
+        running.batch_is_full = False
+        _, _, admitted = self.run_lookahead_scheduler(
+            scheduler,
+            running,
+            window=1,
+            max_bypasses=2,
+        )
+        self.assertEqual(admitted, [big, blocked_small])
+        self.assertEqual(big.prefill_lookahead_bypass_count, 0)
+
+    def test_scheduler_loop_marks_full_when_queue_ends_inside_window(self):
+        big0 = self.create_lookahead_req("big-0", input_len=200)
+        big1 = self.create_lookahead_req("big-1", input_len=200)
+        running_req = self.create_mock_req("running", priority=0, max_new_tokens=1)
+        running = self.create_running_batch([running_req])
+        scheduler, running = self.create_lookahead_scheduler(
+            [big0, big1], running_batch=running
+        )
+
+        _, running, admitted = self.run_lookahead_scheduler(
+            scheduler,
+            running,
+            window=8,
+            max_bypasses=8,
+        )
+        first_round_calls = [
+            big0.init_next_round_input.call_count,
+            big1.init_next_round_input.call_count,
+        ]
+
+        self.assertEqual(admitted, [])
+        self.assertTrue(running.batch_is_full)
+
+        self.run_lookahead_scheduler(
+            scheduler,
+            running,
+            window=8,
+            max_bypasses=8,
+        )
+        self.assertEqual(
+            [
+                big0.init_next_round_input.call_count,
+                big1.init_next_round_input.call_count,
+            ],
+            first_round_calls,
+        )
+
+    def test_scheduler_loop_does_not_cross_priority_boundary(self):
+        high = self.create_lookahead_req("high", input_len=200, priority=10)
+        low = self.create_lookahead_req("low", input_len=10, priority=1)
+        scheduler, running = self.create_lookahead_scheduler([high, low])
+        scheduler.enable_priority_scheduling = True
+
+        _, running, admitted = self.run_lookahead_scheduler(
+            scheduler,
+            running,
+            window=8,
+            max_bypasses=8,
+        )
+
+        self.assertEqual(admitted, [])
+        self.assertEqual(scheduler.waiting_queue, [high, low])
+        self.assertTrue(running.batch_is_full)
+        low.init_next_round_input.assert_not_called()
+
+    def test_scheduler_loop_backfill_before_priority_boundary_keeps_batch_open(self):
+        high_big = self.create_lookahead_req("high-big", input_len=200, priority=10)
+        high_small = self.create_lookahead_req(
+            "high-small", input_len=10, priority=10
+        )
+        low = self.create_lookahead_req("low", input_len=10, priority=1)
+        scheduler, running = self.create_lookahead_scheduler(
+            [high_big, high_small, low]
+        )
+        scheduler.enable_priority_scheduling = True
+
+        _, running, admitted = self.run_lookahead_scheduler(
+            scheduler,
+            running,
+            window=8,
+            max_bypasses=8,
+        )
+
+        self.assertEqual(admitted, [high_small])
+        self.assertEqual(scheduler.waiting_queue, [high_big, low])
+        self.assertFalse(running.batch_is_full)
+        low.init_next_round_input.assert_not_called()
+
+    def test_scheduler_loop_stops_lookahead_after_priority_preemption(self):
+        big0 = self.create_lookahead_req("big-0", input_len=200, priority=10)
+        big1 = self.create_lookahead_req("big-1", input_len=200, priority=10)
+        running_req = self.create_mock_req(
+            "running", priority=0, max_new_tokens=1
+        )
+        running = self.create_running_batch([running_req])
+        scheduler, running = self.create_lookahead_scheduler(
+            [big0, big1], running_batch=running
+        )
+        scheduler.enable_priority_preemption = True
+        scheduler.get_num_allocatable_reqs.return_value = 0
+
+        def record_preemption(adder, _req):
+            adder.preempt_list.append(running_req)
+            return True
+
+        with patch.object(
+            PrefillAdder,
+            "preempt_to_schedule",
+            autospec=True,
+            side_effect=record_preemption,
+        ) as preempt:
+            _, _, admitted = self.run_lookahead_scheduler(
+                scheduler,
+                running,
+                window=8,
+                max_bypasses=8,
+            )
+
+        self.assertEqual(admitted, [])
+        self.assertEqual(preempt.call_count, 1)
+        self.assertEqual(big0.prefill_lookahead_bypass_count, 0)
+        big1.init_next_round_input.assert_not_called()
+
+    def test_scheduler_loop_does_not_record_bypassed_lora_as_running(self):
+        big = self.create_lookahead_req("big", input_len=200)
+        small = self.create_lookahead_req("small", input_len=10)
+        big.lora_id = "shared-lora"
+        small.lora_id = "shared-lora"
+        scheduler, running = self.create_lookahead_scheduler([big, small])
+        scheduler.enable_lora = True
+        scheduler.lora_drainer = None
+        observed_running_loras = []
+
+        def can_schedule(_req, running_loras):
+            observed_running_loras.append(set(running_loras))
+            return True
+
+        scheduler.can_schedule_lora_req = MagicMock(side_effect=can_schedule)
+
+        _, _, admitted = self.run_lookahead_scheduler(
+            scheduler,
+            running,
+            window=1,
+            max_bypasses=8,
+        )
+
+        self.assertEqual(admitted, [small])
+        self.assertEqual(observed_running_loras, [set(), set()])
+
+    def test_scheduler_loop_preserves_lmcache_empty_batch_full_rule(self):
+        big = self.create_lookahead_req("big", input_len=200)
+        scheduler, running = self.create_lookahead_scheduler([big])
+        scheduler.enable_lmcache = True
+
+        _, running, admitted = self.run_lookahead_scheduler(
+            scheduler,
+            running,
+            window=0,
+            max_bypasses=8,
+        )
+
+        self.assertEqual(admitted, [])
+        self.assertFalse(running.batch_is_full)
+
+    def test_scheduler_loop_does_not_terminate_bypassed_hicache_prefetch(self):
+        big = self.create_lookahead_req("big", input_len=200)
+        prefetching = self.create_lookahead_req("prefetching", input_len=10)
+        scheduler, running = self.create_lookahead_scheduler([big, prefetching])
+        scheduler.enable_hicache_storage = True
+        self.mock_tree_cache.has_ongoing_prefetch.side_effect = (
+            lambda handle: handle == prefetching.cache_request_handle
+        )
+
+        _, running, admitted = self.run_lookahead_scheduler(
+            scheduler,
+            running,
+            window=1,
+            max_bypasses=8,
+        )
+
+        self.assertEqual(admitted, [])
+        self.assertTrue(running.batch_is_full)
+        self.mock_tree_cache.check_prefetch_progress.assert_called_once_with(
+            big.cache_request_handle
+        )
+        prefetching.init_next_round_input.assert_not_called()
+
+    def test_dllm_request_local_rejection_marks_batch_full(self):
+        req = self.create_lookahead_req("dllm", input_len=10)
+        scheduler, running = self.create_lookahead_scheduler([req])
+        adder = MagicMock()
+        adder.can_run_list = []
+        adder.add_one_req.return_value = AddReqResult.NO_TOKEN_FOR_REQUEST
+
+        result = scheduler.process_dllm_incoming_reqs(adder, [req], running)
+
+        self.assertEqual(result, AddReqResult.NO_TOKEN_FOR_REQUEST)
+        self.assertTrue(running.batch_is_full)
+
     def test_delayer_not_consulted_when_kv_budget_rejects(self):
         """A rank whose first candidate fails the KV-budget gate must NOT
-        report local_prefillable=True: add_one_req returns NO_TOKEN before
-        negotiating, and finalize() later reports the rank as not
-        prefillable. Regression guard: the negotiate used to run at the top
+        report local_prefillable=True: add_one_req returns
+        NO_TOKEN_FOR_REQUEST before negotiating, and finalize() later reports
+        the rank as not prefillable. Regression guard: the negotiate used to run at the top
         of add_one_req, so under KV pressure a full rank still claimed
         prefillable=True, the delayer saw "all prefillable" and allowed, the
         full ranks then NO_TOKEN'ed out, and the DP-synced forward mixed
@@ -1418,7 +2247,7 @@ class TestPrefillAdder(CustomTestCase):
             truncation_align_size=None,
         )
 
-        self.assertEqual(result, AddReqResult.NO_TOKEN)
+        self.assertEqual(result, AddReqResult.NO_TOKEN_FOR_REQUEST)
         self.assertEqual(delayer.calls, [])
         self.assertEqual(adder.can_run_list, [])
 
@@ -1448,7 +2277,7 @@ class TestPrefillAdder(CustomTestCase):
             truncation_align_size=None,
         )
 
-        self.assertEqual(result, AddReqResult.NO_TOKEN)
+        self.assertEqual(result, AddReqResult.NO_TOKEN_FOR_REQUEST)
         self.assertEqual(delayer.calls, [])
         self.assertEqual(adder.can_run_list, [])
 
@@ -1511,17 +2340,14 @@ class TestPrefillAdder(CustomTestCase):
             **kwargs,
         )
 
-    def _create_delayer_req(self, num_tokens: int):
-        req = self.create_mock_req("delayer_req", priority=0, max_new_tokens=8)
+    def _create_delayer_req(
+        self, num_tokens: int, *, rid="delayer_req", max_new_tokens=8
+    ):
+        req = self.create_mock_req(rid, priority=0, max_new_tokens=max_new_tokens)
         req.full_untruncated_fill_ids = list(range(num_tokens))
         req.host_hit_length = 0
         req.last_node = MagicMock()
         req.sampling_params.ignore_eos = False
-        req.set_extend_range = MagicMock(
-            side_effect=lambda start, end: setattr(
-                req, "extend_range", Range(start, end)
-            )
-        )
         return req
 
     def test_add_chunked_req_non_hybrid_no_swa_reservation(self):
@@ -1539,7 +2365,7 @@ class TestPrefillAdder(CustomTestCase):
 
         result = adder.add_chunked_req(req)
         self.assertIsNone(result)
-        req.set_extend_range.assert_called_once_with(0, 200)
+        self.assertEqual((req.prefix_len, req.extend_end), (0, 200))
         self.assertIn(req, adder.can_run_list)
 
     def _adder_with_extend_lens(self, extend_lens):
