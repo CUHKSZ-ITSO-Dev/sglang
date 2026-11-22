@@ -1,0 +1,137 @@
+name: Release Overlay Image
+#
+# Publishes ghcr.io/<owner>/sglang:<version> from docker/overlay.Dockerfile.
+# Trigger: push a tag named overlay/<version>, e.g. overlay/v0.5.23-lookahead.1.
+# The overlay/ prefix keeps the upstream v* release workflows out of the way.
+
+on:
+  push:
+    tags:
+      - "overlay/*"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: release-overlay-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  unit-test:
+    uses: ./.github/workflows/fork-cpu-unit-test.yml
+
+  publish:
+    needs: unit-test
+    if: github.repository == 'CUHKSZ-ITSO-Dev/sglang'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+          filter: blob:none
+
+      - name: Resolve image tag
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          VERSION="${REF_NAME#overlay/}"
+          # Whole-string check: the value ends up in GITHUB_ENV.
+          case "${VERSION}" in
+            ""|[!a-zA-Z0-9_]*|*[!a-zA-Z0-9._-]*)
+              echo "::error::'${VERSION}' is not a valid image tag"
+              exit 1
+              ;;
+          esac
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "IMAGE=ghcr.io/${OWNER,,}/sglang" >> "$GITHUB_ENV"
+
+      - name: Check the overlay covers exactly the Python changes
+        run: |
+          set -euo pipefail
+          DF=docker/overlay.Dockerfile
+          BASE=$(sed -n 's/^ARG BASE_SGLANG_COMMIT=//p' "$DF")
+          [ -n "${BASE}" ] || { echo "::error::BASE_SGLANG_COMMIT missing in $DF"; exit 1; }
+          git merge-base --is-ancestor "${BASE}" HEAD \
+            || { echo "::error::${BASE} is not an ancestor of HEAD; merge the upstream release first"; exit 1; }
+
+          OWN='^(docker/overlay\.Dockerfile(\.dockerignore)?|\.github/workflows/(release-overlay-image|fork-cpu-unit-test)\.yml)$'
+          deleted=$(git diff --name-only --diff-filter=D "${BASE}" HEAD -- python/ | grep -vE "${OWN}" || true)
+          if [ -n "${deleted}" ]; then
+            echo "::error::Deleted files cannot be expressed as an overlay:"; echo "${deleted}"; exit 1
+          fi
+          changed=$(git diff --name-only --diff-filter=d "${BASE}" HEAD | grep -vE "${OWN}" || true)
+          other=$(printf '%s\n' "${changed}" | grep -vE '^(python/sglang/.*\.py|test/.*|docs/.*)$' | sed '/^$/d' || true)
+          if [ -n "${other}" ]; then
+            echo "::error::Changes outside Python sources need a full image build:"; echo "${other}"; exit 1
+          fi
+          expected=$(printf '%s\n' "${changed}" | grep -E '^python/sglang/.*\.py$' | sort || true)
+          copied=$(sed -nE 's#^COPY --link (python/sglang/[^ ]+\.py) /sgl-workspace/sglang/\1$#\1#p' "$DF" | sort)
+          if ! diff -u <(printf '%s\n' "${expected}") <(printf '%s\n' "${copied}"); then
+            echo "::error::COPY list in $DF does not match python/sglang changes since ${BASE}"; exit 1
+          fi
+          if grep -qE '^\s*RUN\b' "$DF"; then
+            echo "::error::$DF must not contain RUN (it would unpack the base image)"; exit 1
+          fi
+          echo "Overlay files:"; printf '  %s\n' ${copied}
+
+      # The base image is ~16 GB compressed and its layers pass through this
+      # runner on the first push to GHCR.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Disk before build
+        run: df -h /
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Login to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Release builds never read the Actions cache.
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: docker/overlay.Dockerfile
+          platforms: linux/amd64
+          push: true
+          no-cache: true
+          provenance: false
+          sbom: false
+          tags: ${{ env.IMAGE }}:${{ env.VERSION }}
+          build-args: |
+            OVERLAY_COMMIT=${{ github.sha }}
+            OVERLAY_TAG=${{ env.VERSION }}
+
+      - name: Disk after build
+        if: always()
+        run: df -h /
+
+      - name: Write summary
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo "### Published \`${IMAGE}:${VERSION}\`"
+            echo "- **Digest:** \`${IMAGE}@${DIGEST}\`"
+            echo "- **Commit:** \`${GITHUB_SHA}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

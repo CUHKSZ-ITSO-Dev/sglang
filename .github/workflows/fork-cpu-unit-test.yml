@@ -1,0 +1,63 @@
+name: Fork CPU Unit Test
+#
+# Upstream's unit suites run on sgl-project's self-hosted runners and never
+# start on this fork. This job runs the scheduler and server-args unit tests
+# touched by the fork on a GitHub-hosted runner with CPU-only torch.
+# It also gates release-overlay-image.yml through workflow_call.
+
+on:
+  pull_request:
+    branches:
+      - "release/**"
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-cpu-unit-test-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  unit-test:
+    if: github.repository == 'CUHKSZ-ITSO-Dev/sglang'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          python-version: "3.12"
+
+      # Only what these tests import; GPU packages (sglang-kernel, DeepGEMM,
+      # flashinfer, triton kernels) are not needed and not installable on CPU.
+      - name: Install CPU dependencies
+        run: |
+          set -euo pipefail
+          TORCH_VERSION=$(sed -nE 's/^ *"torch==([^"]+)",?.*/\1/p' python/pyproject.toml | head -1)
+          [ -n "${TORCH_VERSION}" ] || { echo "::error::torch pin not found in python/pyproject.toml"; exit 1; }
+          uv venv --python 3.12 .venv
+          uv pip install --python .venv/bin/python "torch==${TORCH_VERSION}" torchvision \
+            --index-url https://download.pytorch.org/whl/cpu
+          uv pip install --python .venv/bin/python \
+            --extra-index-url https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match \
+            numpy msgspec pydantic fastapi uvicorn orjson pyzmq psutil requests aiohttp \
+            packaging regex tqdm pillow scipy setproctitle pybase64 python-multipart \
+            prometheus-client einops interegular partial_json_parser xxhash zstandard \
+            "sentencepiece==0.2.1" tiktoken "transformers==5.19.0" "tokenizers==0.23.2" \
+            "openai==2.8.0" uvloop watchfiles IPython pytest parameterized easydict distro \
+            msgpack "xgrammar==0.2.7" nvidia-ml-py dill compressed_tensors gguf datasets \
+            jsonschema soundfile
+
+      - name: Run unit tests
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          set -euo pipefail
+          PYTHONPATH="$PWD/python" .venv/bin/python -m pytest -q -p no:cacheprovider \
+            test/registered/unit/managers/test_prefill_adder.py \
+            test/registered/unit/managers/test_schedule_policy.py \
+            test/registered/unit/server_args/test_server_args.py

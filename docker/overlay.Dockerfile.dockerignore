@@ -1,0 +1,3 @@
+# Build context for docker/overlay.Dockerfile: only the Python sources it copies.
+*
+!python/sglang/**/*.py

@@ -552,5 +552,7 @@ POSITIONAL_FIELD_ORDER = (
     "enable_return_aux_hidden_states",
     "aux_hidden_state_capture",
     "return_aux_hidden_state_layer_ids",
+    "prefill_lookahead_window",
+    "prefill_lookahead_max_bypasses",
 )
 # fmt: on

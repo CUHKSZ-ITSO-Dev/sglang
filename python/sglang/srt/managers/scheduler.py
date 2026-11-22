@@ -222,6 +222,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
+    PrefillLookahead,
     SchedulePolicy,
     mamba_prefill_chunk_grid,
 )
@@ -1336,6 +1337,8 @@ class Scheduler(
         self.enable_continuous_input_polling = False
         self.enable_skip_finishing_decode = False
         self.forward_ct = 0
+        self.prefill_lookahead_bypass_total = 0
+        self.prefill_lookahead_max_wait_seconds = 0.0
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(
             flush_cache=self.flush_cache,
@@ -4076,6 +4079,33 @@ class Scheduler(
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
+    def _record_prefill_lookahead_bypasses(self, reqs: List[Req]) -> None:
+        """Record requests that a later request actually overtook this round."""
+        now = time.monotonic()
+        for req in reqs:
+            req.prefill_lookahead_bypass_count += 1
+            self.prefill_lookahead_bypass_total += 1
+            wait_queue_entry_time = req.time_stats.wait_queue_entry_time
+            if wait_queue_entry_time > 0:
+                self.prefill_lookahead_max_wait_seconds = max(
+                    self.prefill_lookahead_max_wait_seconds,
+                    now - wait_queue_entry_time,
+                )
+
+            if self.prefill_lookahead_bypass_total % 128 == 0:
+                if (
+                    get_parallel().pp_rank == 0
+                    and get_parallel().attn_tp_rank == 0
+                    and get_parallel().attn_cp_rank == 0
+                ):
+                    logger.info(
+                        "Prefill lookahead: bypasses=%s, "
+                        "max_bypassed_wait_seconds=%.3f",
+                        self.prefill_lookahead_bypass_total,
+                        self.prefill_lookahead_max_wait_seconds,
+                    )
+                self.prefill_lookahead_max_wait_seconds = 0.0
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -4200,12 +4230,48 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
+        schedule_config = get_schedule()
+        lookahead = PrefillLookahead(schedule_config.prefill_lookahead_window)
+        lookahead_blocked_req: Optional[Req] = None
+        pending_bypassed_reqs: List[Req] = []
+        initial_can_run_count = len(adder.can_run_list)
+
+        def mark_batch_full_after_failed_lookahead() -> None:
+            if (
+                self.enable_hierarchical_cache
+                or self.enable_lmcache
+                or self.enable_unified_cache_external_linker
+            ):
+                running_batch.batch_is_full = bool(adder.can_run_list) or (
+                    not running_batch.is_empty()
+                )
+            else:
+                running_batch.batch_is_full = True
+
         # Get requests from the waiting queue to a new prefill batch
-        for req in self.waiting_queue:
+        for queue_index, req in enumerate(self.waiting_queue):
             # A spent pass budget admits no one, even before the first
             # candidate: the resumed chunk or mixed decode rows can spend it.
             if adder.budget_state() == AddReqResult.OTHER:
                 break
+
+            if not lookahead.allows(queue_index):
+                if len(adder.can_run_list) == initial_can_run_count:
+                    mark_batch_full_after_failed_lookahead()
+                break
+
+            # Priority ordering remains strict across priority classes. A
+            # lookahead window may only backfill requests from the same class
+            # as the first blocked request.
+            if (
+                lookahead_blocked_req is not None
+                and self.enable_priority_scheduling
+                and req.priority != lookahead_blocked_req.priority
+            ):
+                if len(adder.can_run_list) == initial_can_run_count:
+                    mark_batch_full_after_failed_lookahead()
+                break
+
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
                 continue
 
@@ -4231,11 +4297,26 @@ class Scheduler(
             ):
                 running_batch.batch_is_full = True
 
+            preempt_list_size_before = len(adder.preempt_list)
             if running_batch.batch_is_full:
                 if not self.enable_priority_preemption or not adder.preempt_to_schedule(
                     req
                 ):
                     break
+            candidate_triggered_preemption = (
+                len(adder.preempt_list) > preempt_list_size_before
+            )
+
+            # Once lookahead has started, do not poll an ongoing HiCache L3
+            # prefetch for a later candidate. check_prefetch_progress() may
+            # terminate an incomplete prefetch, even when that candidate is
+            # subsequently rejected and left in the waiting queue.
+            if (
+                lookahead_blocked_req is not None
+                and self.enable_hicache_storage
+                and self.tree_cache.has_ongoing_prefetch(req.cache_request_handle)
+            ):
+                continue
 
             if self.enable_hicache_storage or self.enable_lmcache:
                 prefetch_done = self.tree_cache.check_prefetch_progress(
@@ -4273,7 +4354,13 @@ class Scheduler(
                 truncation_align_size=self.truncation_align_size,
             )
 
-            if self.enable_lora:
+            added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
+            if added:
+                req.prefill_lookahead_bypass_count = 0
+                if pending_bypassed_reqs:
+                    self._record_prefill_lookahead_bypasses(pending_bypassed_reqs)
+                    pending_bypassed_reqs.clear()
+            if self.enable_lora and added:
                 running_loras.add(req.lora_id)
 
             if res != AddReqResult.CONTINUE:
@@ -4286,7 +4373,6 @@ class Scheduler(
                 # Only free if the slot was freshly allocated in this batch (not
                 # pre-existing from a session). Session-held slots have their own
                 # lifecycle and freeing them here causes double-free.
-                added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added:
                     # init_next_round_input() may stage deferred Mamba COW/clear
                     # metadata before add_one_req() rejects the request.
@@ -4297,7 +4383,35 @@ class Scheduler(
                             req.kv.mamba_pool_idx.unsqueeze(-1)
                         )
                         req.kv.mamba_pool_idx = None
+
+                # A failed candidate that already preempted running requests
+                # must end this scheduling pass. Continuing lookahead could
+                # preempt more requests while no replacement is admitted.
+                if not candidate_triggered_preemption and lookahead.can_bypass(
+                    res, added
+                ):
+                    bypass_count = req.prefill_lookahead_bypass_count
+                    if (
+                        bypass_count < schedule_config.prefill_lookahead_max_bypasses
+                        and lookahead.start(queue_index)
+                    ):
+                        pending_bypassed_reqs.append(req)
+                        if lookahead_blocked_req is None:
+                            lookahead_blocked_req = req
+                        continue
+
+                if res == AddReqResult.NO_TOKEN_FOR_REQUEST:
+                    mark_batch_full_after_failed_lookahead()
                 break
+
+        # The queue may end before the window boundary. If every inspected
+        # candidate was rejected, avoid repeating the same work every decode
+        # step until the running batch releases KV capacity.
+        if (
+            lookahead_blocked_req is not None
+            and len(adder.can_run_list) == initial_can_run_count
+        ):
+            mark_batch_full_after_failed_lookahead()
 
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
