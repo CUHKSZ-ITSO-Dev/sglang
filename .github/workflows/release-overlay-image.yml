@@ -18,7 +18,11 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  unit-test:
+    uses: ./.github/workflows/fork-cpu-unit-test.yml
+
   publish:
+    needs: unit-test
     if: github.repository == 'CUHKSZ-ITSO-Dev/sglang'
     runs-on: ubuntu-latest
     timeout-minutes: 120
@@ -55,7 +59,7 @@ jobs:
           git merge-base --is-ancestor "${BASE}" HEAD \
             || { echo "::error::${BASE} is not an ancestor of HEAD; merge the upstream release first"; exit 1; }
 
-          OWN='^(docker/overlay\.Dockerfile(\.dockerignore)?|\.github/workflows/release-overlay-image\.yml)$'
+          OWN='^(docker/overlay\.Dockerfile(\.dockerignore)?|\.github/workflows/(release-overlay-image|fork-cpu-unit-test)\.yml)$'
           deleted=$(git diff --name-only --diff-filter=D "${BASE}" HEAD -- python/ | grep -vE "${OWN}" || true)
           if [ -n "${deleted}" ]; then
             echo "::error::Deleted files cannot be expressed as an overlay:"; echo "${deleted}"; exit 1
